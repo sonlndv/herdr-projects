@@ -63,6 +63,8 @@ export interface PlaceTab {
   named?: boolean
   term: string
   cli?: string
+  /** The attached runtime can read this terminal's exact native session as chat. */
+  chatSupported?: boolean
   state?: TabState
   where?: string
   /** what its pane header calls it: "Claude Code", the program in front ("zsh"), else "Shell" */
@@ -393,6 +395,8 @@ export interface Automation {
 /** A question card: built-in choice cards, a CLI's own menus, plans. */
 export interface Choice {
   label: string
+  /** Native answer value, forwarded unchanged by the service for this choice. */
+  value?: unknown
   description?: string
   /** the agent marked it (Recommended) */
   recommended?: boolean
@@ -412,6 +416,8 @@ export interface Question {
   /** CLI prompt context, read from its visible screen. */
   screen?: string
   terminal?: boolean
+  /** Native requests never use terminal keystroke emulation or implicit dismissal. */
+  native?: { requestId: string; answerable: boolean; questions?: { id: string; multi?: boolean }[] }
   /** A CLI's own menu: a tap presses that choice at once. */
   press?: boolean
   /** a task worker's ask in its Assistant's chat (3.0's): headed by its task, "Open chat" goes to its own chat */
@@ -829,6 +835,36 @@ export const cardMessage = (card: UpdateCard, at?: number): Message => ({
   card,
 })
 
+/** Native engine work is not a Shepherdr task or a separately owned chat. Keep its graph and states intact. */
+export interface NativeWork {
+  id: string
+  title: string
+  kind?: string
+  status?: string
+  parentId?: string
+  dependencies?: string[]
+  details?: unknown
+}
+
+export interface ChatRuntime {
+  kind: string
+  name: string
+  sessionId?: string
+  settled?: boolean | null
+  pendingAsyncWork?: boolean | null
+  capabilities: {
+    history: boolean
+    send: boolean
+    interrupt: boolean
+    configure: boolean
+    answer: boolean
+    answerPlan?: boolean
+    fork: boolean
+    steer?: boolean
+    images?: boolean
+  }
+}
+
 export interface Chat {
   key: string
   /** the agent's and yours, and Shepherdr's update cards among them */
@@ -861,6 +897,9 @@ export interface Chat {
   /** what it started in the background that still runs: subagents, shells, headless agents */
   jobs?: Job[]
   cli: string
+  /** Native identity shared by Chat and Terminal; never an independently launched chat engine. */
+  runtime?: ChatRuntime
+  nativeWork?: NativeWork[]
   /** what this CLI lets the + menu change; only what it supports is listed */
   controls?: ChatControls
   /** Recorded launch values, never inferred from Settings. Missing values are CLI defaults, not observed telemetry. */
@@ -886,7 +925,7 @@ export interface RestartHint {
 export interface RestartCli {
   kind: string
   name: string
-  models?: { id: string; label: string; efforts: string[]; defaultEffort?: string }[]
+  models?: { id: string; label: string; efforts: string[]; defaultEffort?: string; nativeDefault?: boolean }[]
   /** the levels its own default model takes */
   efforts?: string[]
   defaultModel?: string
@@ -1015,7 +1054,7 @@ export interface AgentPick { agent: string; model?: string | null; effort?: stri
 
 /** Settings › Agents' model menu, as the window's (mods/chat-models, settings mode; core/agents.js menuFor) */
 export interface ModelMenus {
-  menus: Record<string, { name: string; models: { id: string; name: string; efforts: string[]; defaultEffort?: string | null; fast?: boolean }[]; perms: { id: string; label: string }[] }>
+  menus: Record<string, { name: string; icon?: string; error?: string; capabilities?: { configure?: boolean; customModel?: boolean }; models: { id: string; name: string; efforts: string[]; defaultEffort?: string | null; fast?: boolean; nativeDefault?: boolean }[]; perms: { id: string; label: string }[] }>
   permDefault: Record<string, string>
 }
 

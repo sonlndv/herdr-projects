@@ -133,7 +133,8 @@ def move_data(r, a, home):
         r.notes.append(n)
 # Helpers on the PATH: their name, and where the link leads (under the app home).
 LINKS = {"herdr-task": "mods/tasks/bin/herdr-task", "herdr-artifact": "mods/artifacts/bin/herdr-artifact",
-         "herdr-secret": "bin/herdr-secret", "herdr-browser": "bin/herdr-browser", "shepherdr": "bin/shepherdr"}
+         "herdr-secret": "bin/herdr-secret", "herdr-browser": "bin/herdr-browser", "shepherdr": "bin/shepherdr",
+         "shepherdr-native": "bin/shepherdr-native", "shepherdr-native-run": "bin/shepherdr-native-run"}
 # Written by Herdr into each mod (editor types): never ours, never touched.
 GENERATED = {"gpui-kit.d.ts", "jsconfig.json"}
 SKIP = {"__pycache__", ".DS_Store"}

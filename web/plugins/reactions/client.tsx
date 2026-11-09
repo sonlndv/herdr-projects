@@ -239,6 +239,7 @@ const EDGE = 8
     Your emoji sit above it and the menu below it, on its side, inside the screen; the message moves to make room, and
     one too tall to fit shows the part the finger held. Picking anything, or a tap outside, sets it back down. */
 function Lifted({ msg, chat }: { msg: Message; chat: string }) {
+  const runtime = useStore((s) => s.chats[chat]?.runtime)
   const root = useRef<HTMLDivElement>(null)
   const shade = useRef<HTMLDivElement>(null)
   const lift = useRef<HTMLDivElement>(null)
@@ -391,7 +392,7 @@ function Lifted({ msg, chat }: { msg: Message; chat: string }) {
               </MenuItem>
               {/* Shepherdr 3: an agent's message forks the conversation into a new tab; yours rewinds it there (the CLI's own) */}
               {/* as the window's: Rewind on yours but a /command, Fork on the agent's */}
-              {msg.card || (msg.who !== 'agent' && msg.text?.trimStart().startsWith('/')) ? null : msg.who === 'agent' ? (
+              {msg.card || runtime && (msg.who !== 'agent' || !runtime.capabilities.fork) || (msg.who !== 'agent' && msg.text?.trimStart().startsWith('/')) ? null : msg.who === 'agent' ? (
                 <MenuItem icon={<ForkIcon className={ic} />} onClick={() => leave(() => void act({ type: 'fork', chat } as never).catch((e) => alert(e.message)))}>
                   Fork
                 </MenuItem>

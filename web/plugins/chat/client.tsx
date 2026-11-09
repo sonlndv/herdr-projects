@@ -13,6 +13,7 @@ import { AlertIcon, BackIcon, CameraIcon, CheckIcon, CopyIcon, Count, DeleteIcon
 import { canDictate, dictate, dictSample, type Dictation } from '@client/dictation.ts'
 import { extOf, isImage, isVideo } from '@shared/files.ts'
 import { modelCommand, modeName, taskChatId, type CardAsk, type Chat, type Choice, type MergeEvidence, type Message, type Place, type Question, type ReplyQuote, type SecretAsk, type UpdateCard } from '@shared/types.ts'
+import { canAnswerQuestion, nativeFormAnswers, runtimeName } from '@shared/runtime.ts'
 import { sendsOnTap } from '@shared/alerts.ts'
 import { buzz, ForkIcon, mine, openBar, openPicker, quick, react, RewindIcon } from '@plugins/reactions/client.tsx'
 import { EDGE } from '@client/gestures.ts'
@@ -25,7 +26,7 @@ import { Fold } from './fold.tsx'
 import { Markdown } from './markdown.tsx'
 import { answeredBy, cancelReply, canReply, isArtifact, jumpTo, startReply } from './reply.ts'
 import { typing, working } from './typing.ts'
-import { JobsSheet, JobsTag, NeedsYou, openSubagent, TurnLine, useSubagent, WorkingLine } from './activity.tsx'
+import { JobsSheet, JobsTag, NativeWorkPanel, NeedsYou, openSubagent, TurnLine, useSubagent, WorkingLine } from './activity.tsx'
 import { ClockIcon } from '@heroicons/react/16/solid'
 import { AskedRow, Band, BriefRow, Chips, EndedRow, ErrorRow, NoteRow, Notice, HeadRow, ImagesLine, NewsRow, onTerminal, PilotRow, PublishingRow, questionsBelow, ReplyLine, Thumbs, WORDS } from './rows.tsx'
 import { AgentLine, openModelMenu, openRestart, RestartSheet } from '@client/restart.tsx'
@@ -269,7 +270,7 @@ function Held({ chatKey }: { chatKey: string }) {
 /** one in its CLI's own queue (#662): Queued, and Send now when the agent is Claude Code (its Ctrl+Enter takes it at
  *  once, mid-turn; the service presses it only while its screen offers it). Why it couldn't, in place of Send now */
 function InQueue({ chatKey }: { chatKey: string }) {
-  const claude = useStore((s) => s.chats[chatKey]?.agent?.kind === 'claude')
+  const canSteer = useStore((s) => { const c = s.chats[chatKey]; return c?.runtime ? c.runtime.capabilities.steer === true : c?.agent?.kind === 'claude' })
   const [state, setState] = useState<'idle' | 'sending' | string>('idle')
   const now = () => {
     setState('sending')
@@ -278,7 +279,7 @@ function InQueue({ chatKey }: { chatKey: string }) {
   return (
     <>
       {WORDS.inQueue}
-      {claude ? state === 'idle' ? <>{' · '}<LinkButton onClick={now}>{WORDS.sendNow}</LinkButton></> : state === 'sending' ? ' · Sending…' : <>{' · '}{state}</> : null}
+      {canSteer ? state === 'idle' ? <>{' · '}<LinkButton onClick={now}>{WORDS.sendNow}</LinkButton></> : state === 'sending' ? ' · Sending…' : <>{' · '}{state}</> : null}
     </>
   )
 }
@@ -1377,12 +1378,12 @@ export function CardShell({ title, plan, icon, action, source, head, children }:
  *  the CLI asks in its terminal, which then shows) and "Dismiss" (or Esc on the card: closed without an answer, as Esc
  *  in the CLI's prompt; the agent hears it was declined and carries on). A CLI's start screen has no Dismiss. */
 function askHead(q: Question, chat: Chat) {
-  const dismiss = q.press ? undefined : () => void act({ type: 'answer', chat: chat.key, question: q.id, dismiss: true } as never).catch(() => undefined)
+  const dismiss = q.press || q.native || chat.runtime ? undefined : () => void act({ type: 'answer', chat: chat.key, question: q.id, dismiss: true } as never).catch(() => undefined)
   const last = dismiss ? [{ label: 'Dismiss', fn: dismiss }] : []
   // a task worker's, in its Assistant's chat: headed by its task, its own chat a link (no terminal link)
   if (q.by) return { who: q.by.ref, links: [{ label: 'Open chat', fn: () => goChat(q.by!.chat) }, ...last], dismiss }
-  const terminal = () => void act({ type: 'answer', chat: chat.key, question: q.id, terminal: true } as never).then(() => openTerminal(chat.key), () => undefined)
-  return { who: chat.cli === 'codex' ? 'Codex' : 'Claude', links: [{ label: 'Answer in terminal', fn: terminal }, ...last], dismiss }
+  const terminal = q.native || chat.runtime ? () => openTerminal(chat.key) : () => void act({ type: 'answer', chat: chat.key, question: q.id, terminal: true } as never).then(() => openTerminal(chat.key), () => undefined)
+  return { who: q.asks ?? runtimeName(chat), links: [...(has('terminal') ? [{ label: 'Answer in terminal', fn: terminal }] : []), ...last], dismiss }
 }
 
 /** a questions card's "Chat about this": no answer; the agent hears the person wants to talk it over, and the box
@@ -1486,7 +1487,8 @@ function StepsCard({ q, chat, source, steady }: { q: Question & { parts: NonNull
     if (!done || busy) return
     setBusy(true); setErr('')
     try {
-      const r = await act({ type: 'answer', chat: chat.key, question: q.id, answers: q.parts.map((_, i) => answerOf(i)) } as never)
+      const response = q.native?.questions ? { nativeAnswers: nativeFormAnswers(q, picks, others) } : { answers: q.parts.map((_, i) => answerOf(i)) }
+      const r = await act({ type: 'answer', chat: chat.key, question: q.id, ...response } as never)
       if ((r as { ok?: boolean })?.ok === false) { setErr((r as { error?: string }).error ?? "That didn't go through."); setBusy(false) }
     } catch (e) { setErr(reasonOf(e)); setBusy(false) }
   }
@@ -1560,8 +1562,13 @@ function StepsCard({ q, chat, source, steady }: { q: Question & { parts: NonNull
 
 /** steady: in Needs you, the card keeps its height while it sends */
 export function QuestionCard(props: { q: Question; chat: Chat; msg: string; from: string; source?: CardSource; steady?: boolean }) {
-  const { q } = props
-  return q.parts && q.parts.length > 1 ? <StepsCard {...props} q={{ ...q, parts: q.parts }} /> : <OneQuestionCard {...props} />
+  const { q, chat } = props
+  if (!canAnswerQuestion(q, chat) && q.sent === undefined && !q.closed) return <CardShell title={q.title} source={props.source} head={askHead(q, chat)}>
+    {q.screen ? <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words text-xs text-fg2">{q.screen}</pre> : null}
+    {q.plan ? <Markdown text={q.plan} /> : null}
+    <p className="text-[0.8125rem] text-fg2">This native dialog must be answered in its terminal. Chat does not approve or dismiss it.</p>
+  </CardShell>
+  return q.parts && (q.parts.length > 1 || q.native?.questions?.length) ? <StepsCard {...props} q={{ ...q, parts: q.parts }} /> : <OneQuestionCard {...props} />
 }
 
 function OneQuestionCard({ q, chat, msg, from, source, steady }: { q: Question; chat: Chat; msg: string; from: string; source?: CardSource; steady?: boolean }) {
@@ -1676,7 +1683,7 @@ function OneQuestionCard({ q, chat, msg, from, source, steady }: { q: Question; 
           }}
         />
       ) : null}
-      {q.other && !sent ? <ChatAbout q={q} chat={chat} /> : null}
+      {q.other && !sent && !q.native && !chat.runtime ? <ChatAbout q={q} chat={chat} /> : null}
       {sent ? (
         <Sent className={q.closed ? 'text-fg2!' : undefined}>
           {q.closed ? <XIcon className={ic} /> : <CheckIcon className={ic} />}
@@ -1799,6 +1806,10 @@ async function deliver(cid: string) {
   if (delivering.has(cid)) return
   const first = getState().outbox.find((x) => x.cid === cid)
   if (!first || first.state !== 'sending') return
+  if (first.nativeAttempted) {
+    setOutbox((all) => all.map((o) => o.cid === cid ? { ...o, state: 'failed', error: 'Native admission was not confirmed. Check the native session before sending again.' } : o))
+    return
+  }
   delivering.add(cid)
   // the agent gets them in the order they were sent: this one's message waits for the ones sent before it in this
   // chat (words sent while earlier pictures still go up never overtake them); their files go up meanwhile
@@ -1828,11 +1839,11 @@ async function deliver(cid: string) {
     const release = holdReload()
     let r: { waiting?: boolean; waitsFor?: Outgoing['waitsFor']; at?: number }
     try {
-      r = (await retrying(
-        () => act({ type: 'send', chat: o.chat, text: o.text, attachments: files.map((f) => f.path), cid, reply: o.reply?.id, human: true, ...(o.hold ? { hold: true } : {}) } as never, AbortSignal.timeout(SEND_TIMEOUT)),
-        since,
-        { onWait },
-      )) as typeof r
+      const native = !!getState().chats[o.chat]?.runtime
+      if (native) patch(() => ({ nativeAttempted: true }))
+      const send = () => act({ type: 'send', chat: o.chat, text: o.text, attachments: files.map((f) => f.path), cid, reply: o.reply?.id, human: true, ...(o.hold ? { hold: true } : {}) } as never, AbortSignal.timeout(SEND_TIMEOUT))
+      // Native admission is not replay-safe after an ambiguous network failure.
+      r = (native ? await send() : await retrying(send, since, { onWait })) as typeof r
     } finally {
       release()
     }
@@ -1841,7 +1852,7 @@ async function deliver(cid: string) {
     patch((x) => ({ state: 'sent', error: undefined, offline: undefined, up: undefined, serverAt, ...(x.queued || x.wentAt ? {} : { waiting: r?.waiting || undefined, waitsFor: (r?.waiting && r.waitsFor) || undefined }) }))
     void dropFiles(standIns)
   } catch (e) {
-    patch(() => ({ state: 'failed', error: reasonOf(e), offline: undefined, up: undefined }))
+    patch((o) => ({ state: 'failed', error: o.nativeAttempted ? `Native admission was not confirmed. Check the native session before sending again. ${reasonOf(e)}` : reasonOf(e), offline: undefined, up: undefined }))
   } finally {
     delivering.delete(cid)
     gates.delete(cid)
@@ -1859,6 +1870,7 @@ function retry(cid: string) {
   const o = s.outbox.find((x) => x.cid === cid)
   if (!o) return
   const again: Outgoing = { ...o, cid: o.lost ? newCid() : o.cid, state: 'sending', error: undefined, lost: undefined, waiting: undefined, waitsFor: undefined, queued: undefined, serverAt: undefined, wentAt: undefined, busyAt: undefined, pastAt: undefined, offline: undefined, up: undefined, at: Date.now(), prior: priorOf(s.chats[o.chat]), after: anchorOf(s.chats[o.chat]), before: s.outbox.filter((x) => x.chat === o.chat && x.cid !== cid).map((x) => x.cid) }
+  delete again.nativeAttempted
   setOutbox((all) => all.map((x) => (x.cid === cid ? again : x)))
   void deliver(again.cid)
 }
@@ -1907,7 +1919,9 @@ function Composer({ chatKey, placeholder, cli }: { chatKey: string; placeholder:
   const plus = useUI((u) => u.plus === chatKey)
   const ref = useRef<HTMLTextAreaElement>(null)
   const live = useUI((u) => registry.composerLive.find((l) => l.when(u, chatKey)))
-  const sendable = !!(text.trim() || files.length)
+  const imagesSupported = useStore((s) => s.chats[chatKey]?.runtime?.capabilities.images !== false)
+  const unsupportedImages = !imagesSupported && files.some((f) => isImage(f.name))
+  const sendable = !unsupportedImages && !!(text.trim() || files.length)
   const Mic = registry.composerMic
   useEffect(() => {
     if (focused && device === 'desktop') ref.current?.focus()
@@ -1994,11 +2008,11 @@ function Composer({ chatKey, placeholder, cli }: { chatKey: string; placeholder:
   const takeMention = (i: Item) => { setText(takeItem(chatKey, text, i)); ref.current?.focus() }
   const send = (hold = false) => {
     const t = expandPicked(chatKey, text.trim())
-    if (!t && !files.length) return
+    if (unsupportedImages || !t && !files.length) return
     recall.current = -1
     const reply = getState().ui.reply[chatKey]
     const model = reply ? undefined : modelCommand(t)
-    if (model !== undefined) {
+    if (model !== undefined && !getState().chats[chatKey]?.runtime) {
       setText('')
       const place = getState().snap?.places.find((p) => p.chat === chatKey)
       // as the window's: /model never reaches the CLI; it opens the model menu, that model chosen
@@ -2033,6 +2047,7 @@ function Composer({ chatKey, placeholder, cli }: { chatKey: string; placeholder:
     // shows over the box (working, queued, jobs, lists) is a stack with one gap, none of its own: as the window's
     <div data-kb data-keep-box className={clsx('mx-auto flex w-full max-w-read shrink-0 flex-col gap-2 px-4 pt-2', keyboard && device === 'phone' ? 'pb-1' : 'pb-2.5')}>
       <ComposerAbove chatKey={chatKey} cli={cli} />
+      {unsupportedImages ? <p role="alert" className="text-[0.8125rem] text-need-fg">This native session cannot accept images from Chat. Remove the images before sending, or continue in its native terminal.</p> : null}
       <SlashList chatKey={chatKey} text={text} pick={(name) => { setText(`/${name} `); ref.current?.focus() }} />
       <MentionList items={mentions} sel={msel} from={reach?.from ?? null} pick={takeMention} />
       {/* the window's box: the words across its full width, then a row in it of attach on the left and on the right
@@ -2108,7 +2123,7 @@ function Composer({ chatKey, placeholder, cli }: { chatKey: string; placeholder:
                     e.preventDefault()
                     // a reply is dropped first; an empty box stops a working agent (the window's Esc); then the box lets go
                     if (getState().ui.reply[chatKey]) return cancelReply(chatKey)
-                    if (!text.trim() && getState().chats[chatKey]?.working) return void act({ type: 'stop', chat: chatKey }).catch(() => undefined)
+                    if (!text.trim() && getState().chats[chatKey]?.working && getState().chats[chatKey]?.runtime?.capabilities.interrupt !== false) return void act({ type: 'stop', chat: chatKey }).catch(() => undefined)
                     ref.current?.blur()
                     setUI({ focus: null })
                   }
@@ -2859,11 +2874,11 @@ function StickToBottom({ chatKey, children }: { chatKey: string; children: React
  *  id, or the agent of one of the space's tabs */
 function placeholderOf(chatKey: string, chat: Chat | undefined, fallback: string) {
   // a card asks, or the agent asks in its terminal: words written here answer it
-  if (chat?.blocked !== undefined || chat?.messages.some((m) => m.question && m.question.sent === undefined && !m.question.closed)) return WORDS.replyInstead
+  if (!chat?.runtime && (chat?.blocked !== undefined || chat?.messages.some((m) => m.question && m.question.sent === undefined && !m.question.closed))) return WORDS.replyInstead
   if (chatKey.startsWith('p:')) return 'Message the Assistant'
   const task = taskChatId(chatKey)
   if (task) return `Message ${task}`
-  return chatKey.startsWith('t:') ? `Message ${({ claude: 'Claude Code', codex: 'Codex' } as Record<string, string>)[chat?.cli ?? ''] ?? 'the agent'}` : fallback
+  return chatKey.startsWith('t:') ? `Message ${runtimeName(chat)}` : fallback
 }
 
 /** a task whose agent has ended: the window's line and its Resume, in place of the message box */
@@ -2903,9 +2918,12 @@ function ChatView({ chatKey, placeholder, unreachable }: { chatKey: string; plac
             </div>
           </div>
         ) : null}
-        <Messages chat={chat ?? { key: chatKey, cli: 'Claude Code', messages: [] }} from={from} />
+        <Messages chat={chat ?? { key: chatKey, cli: '', messages: [] }} from={from} />
       </StickToBottom>
-      {chat?.finished && taskChatId(chatKey) ? <Ended chatKey={chatKey} /> : <Composer chatKey={chatKey} placeholder={placeholderOf(chatKey, chat, placeholder)} cli={chat?.cli ?? 'Claude Code'} />}
+      <NativeWorkPanel chatKey={chatKey} />
+      {chat?.runtime?.capabilities.send === false ? <div className="mx-auto w-full max-w-read px-5 py-3 text-[0.8125rem] text-fg2">
+        Chat is read-only for {runtimeName(chat)}. {has('terminal') ? <LinkButton onClick={() => openTerminal(chatKey)}>Continue in its terminal</LinkButton> : 'Continue in its native terminal.'}
+      </div> : chat?.finished && taskChatId(chatKey) ? <Ended chatKey={chatKey} /> : <Composer chatKey={chatKey} placeholder={placeholderOf(chatKey, chat, placeholder)} cli={runtimeName(chat)} />}
     </DropFiles>
   )
 }

@@ -69,3 +69,53 @@ test("every agent with a fast mode shows the Fast switch, and turning it off sti
   const claudeOff = argvFor({ agent: "claude", model: "opus", fast: false }, { agent: "claude", argv: ["claude"] }).argv;
   expect(current("claude", claudeOff, {}, { fast: true }).fast).toBe(false);
 });
+
+test("native catalogs retain runtime models without invented effort or permission modes", () => {
+  for (const agent of ["omp", "omo", "omh", "hermes"]) {
+    const data = parseDefaults(agent, JSON.stringify({ models: [{ id: "provider/model", label: "Native model", efforts: ["off", "high"] }] }));
+    expect(menuFor(agent, data).models[0]).toMatchObject({ id: "provider/model", efforts: ["off", "high"], fast: false });
+    expect(menuFor(agent, data).perms).toEqual([]);
+    expect(menuFor(agent, { models: [{ id: "native" }] }).models[0].efforts).toEqual([]);
+    expect(current(agent, [], { model: { id: "actual", contextWindow: 32000 }, thinking: "off" }, data))
+      .toMatchObject({ agent, model: "actual", effort: "off", window: 32000, perm: null });
+  }
+});
+
+test("native launch uses its native TUI launcher and exact session file, never Claude flags", () => {
+  for (const agent of ["omp", "omo", "omh", "hermes"]) {
+    const built = argvFor({ agent, model: "provider/model", effort: "high", profile: agent === "omo" ? undefined : "work" }, { agent: "claude", argv: ["claude", "--dangerously-skip-permissions"] });
+    expect(built.base.slice(0, 2)).toEqual(["shepherdr-native-run", agent]);
+    expect(JSON.parse(built.base[2])).toMatchObject({ model: "provider/model", effort: "high" });
+    expect(built.resume).toBe(false);
+    expect(built.argv.join(" ")).not.toContain("dangerously");
+  }
+  const resumed = argvFor({ agent: "omp" }, { agent: "omp", sessionFile: "/exact/one.jsonl" });
+  expect(JSON.parse(resumed.argv[2]).sessionFile).toBe("/exact/one.jsonl");
+  expect(() => argvFor({ agent: "omp", perm: "full" }, {})).toThrow();
+  expect(() => argvFor({ agent: "mystery" }, {})).toThrow();
+  expect(() => current("mystery", [], {}, {})).toThrow();
+});
+
+test("native menus cannot invent typed or formerly pinned native models", () => {
+  const native = { omp: menuFor("omp", { models: [{ id: "known", label: "Known" }] }) };
+  const saved = { pinned: ["omp:removed"], recent: ["omp:removed"] };
+  expect(modelSections(native, "omp", saved, "").flatMap((s) => s.rows).map((r) => r.id)).toEqual(["known"]);
+  expect(modelSections(native, "omp", saved, "unknown")).toEqual([]);
+});
+
+test("native default is an explicit launch choice, not a fabricated observed model", () => {
+  const menu = menuFor("omo", { error: "Native catalog needs a session" });
+  expect(menu.models[0]).toMatchObject({ id: "", name: "OMO defaults", nativeDefault: true, efforts: [] });
+  expect(menu.error).toBe("Native catalog needs a session");
+  expect(menu.capabilities.configure).toBe(false);
+  expect(current("omo", [], {}, {}).model).toBeNull();
+  expect(JSON.parse(argvFor({ agent: "omo", model: "" }, {}).argv[2])).not.toHaveProperty("model");
+  expect(menuFor("omo", { native: { capabilities: { configure: true } } }, "actual").capabilities.configure).toBe(true);
+});
+
+test("a session-targeted native model keeps its provider-qualified identity for effort-only Apply", () => {
+  const meta = { model: { id: "model-a", provider: "native" }, thinking: "high" };
+  const selected = current("hermes", [], meta, { model: "native:model-a", models: [{ id: "native:model-a", label: "Model A" }] });
+  expect(selected).toMatchObject({ model: "native:model-a", label: "Model A", effort: "high" });
+  expect(current("hermes", [], meta, { model: null }).model).toBe("model-a");
+});

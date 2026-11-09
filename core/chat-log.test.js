@@ -256,3 +256,52 @@ test("a template's example news lines are words, real news lines are news (#589)
   // a real tag holding code is still Herdr's: hidden whole, the words around it shown
   expect(c.items[3].text).toBe("And look at `<herdr-news>` too");
 });
+
+test("native blocks preserve text/tool order, IDs and failed result associations", () => {
+  const c = new Conversation("omp");
+  c.feedNative([
+    { id: "native-user", role: "user", content: "Please inspect this", timestamp: 123 },
+    { id: "native-assistant", role: "assistant", model: "provider/model", provider: "provider", content: [
+      { type: "text", text: "Before" },
+      { type: "toolCall", id: "native-call", name: "read", arguments: { path: "/work/a" } },
+      { type: "text", text: "After" },
+    ] },
+    { id: "native-result", role: "toolResult", toolCallId: "native-call", toolName: "read", content: "Permission denied", isError: true },
+  ]);
+  expect(c.items.map((item) => item.kind)).toEqual(["user", "agent", "tools", "agent", "error"]);
+  expect(c.items[0]).toMatchObject({ id: "native-user", at: 123 });
+  expect(c.items[1]).toMatchObject({ id: "native-assistant", text: "Before" });
+  expect(c.items[2].steps[0]).toMatchObject({ id: "native-call", resultId: "native-result", out: "native-result", isError: true });
+  expect(c.items[3]).toMatchObject({ id: "native-assistant:2", text: "After" });
+  expect(c.items[4]).toMatchObject({ id: "native-result", toolCallId: "native-call" });
+  expect(c.nativeResults.get("native-call")).toBe("Permission denied");
+  expect(c.open.size).toBe(0);
+  expect(c.meta).toMatchObject({ model: "provider/model", provider: "provider" });
+});
+
+test("a native result preceding a call across bounded pages still closes its exact call", () => {
+  const c = new Conversation("hermes");
+  c.feedNative([{ id: "r", role: "toolResult", toolCallId: "call", content: [{ type: "text", text: "complete" }] }]);
+  c.feedNative([{ id: "a", role: "assistant", content: [{ type: "toolCall", id: "call", name: "shell", arguments: { command: "echo hello" } }] }]);
+  expect(c.items[0].steps[0]).toMatchObject({ id: "call", out: "r", resultId: "r" });
+  expect(c.nativeResults.get("call")).toBe("complete");
+  expect(c.open.size).toBe(0);
+});
+
+test("native settlement does not infer completion from an assistant message", () => {
+  const c = new Conversation("omo");
+  c.feedNative([{ id: "a", role: "assistant", content: [{ type: "toolCall", id: "call", name: "watch", arguments: {} }] }]);
+  c.feedNative([{ id: "reply", role: "assistant", content: "A watcher remains active." }]);
+  c.applyNative({ settled: null, pendingAsyncWork: true });
+  expect(c.doing).not.toBeNull();
+  c.applyNative({ settled: true, pendingAsyncWork: false, working: false });
+  expect(c.doing).toBeNull();
+});
+
+test("native question completion clears waiting even when background settlement remains unknown", () => {
+  const conversation = new Conversation("omp");
+  conversation.applyNative({ pendingRequests: [{ id: "plan-review" }], settled: null, working: false });
+  expect(conversation.waiting).toBe(true);
+  conversation.applyNative({ pendingRequests: [], settled: null, working: true });
+  expect(conversation.waiting).toBe(false);
+});

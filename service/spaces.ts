@@ -12,6 +12,8 @@ import { exec } from "./model.ts";
 import * as NS from "../core/newspace.js";
 import * as SP from "../core/spaces.js";
 import { cleanCommand } from "../core/clean-env.js";
+import { SH } from "../core/paths.js";
+import { isNative } from "../core/native-runtime.js";
 
 export const withWindow = () => existsSync(join(process.env.HERDR_APP_HOME || join(HOME, ".config", "herdr-app"), "mods", "spaces-chat"));
 
@@ -79,6 +81,70 @@ export async function execTemplate(hub: Hub, name: string, machine: string | nul
   return { name: one, words: src.slice(head[0].length).trim(), done: () => void exec(hub, ["sh", "-c", DIR + 'rm -f "$dir/$1.md"', "x", one], machine).catch(() => null) };
 }
 
+export interface NativeAssistantCommand { argv: string[]; kind: string }
+
+/** Resolve native role settings on the owning machine; only the native launcher admits its first prompt. */
+export async function nativeAssistantCommand(hub: Hub, options: { space: string; folder: string; machine: string | null; words: string; message: string; files?: string[] }): Promise<NativeAssistantCommand | null> {
+  const response = await exec(hub, ["sh", "-c", `${SH}f="\${HERDR_TASK_SETTINGS:-$SHEP_SETTINGS}"; if [ -f "$f" ]; then cat "$f"; else printf '{}'; fi`, "native-assistant-settings"], options.machine);
+  if (response.code !== 0) throw new Error("The native Assistant's settings could not be read on its machine.");
+  let value: unknown;
+  try { value = JSON.parse(response.stdout); }
+  catch { throw new Error("The native Assistant's settings file is not valid JSON."); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The Assistant settings file must contain an object.");
+  const record = (part: unknown, label: string): Record<string, unknown> => {
+    if (part === undefined || part === null) return {};
+    if (typeof part !== "object" || Array.isArray(part)) throw new Error(`Invalid Assistant settings: ${label} must be an object.`);
+    return part as Record<string, unknown>;
+  };
+  const file = record(value, "file");
+  const spaces = record(file.spaces, "spaces");
+  const machines = record(file.machines, "machines");
+  const bare = options.space.split("/").pop() || options.space;
+  const qualified = options.machine ? `${options.machine}/${bare}` : options.space;
+  let space = spaces[options.space] ?? spaces[qualified] ?? spaces[bare];
+  if (space === undefined) {
+    const matching = Object.values(spaces).filter((part) => record(part, "space").folder === options.folder);
+    if (matching.length > 1) throw new Error("More than one space's settings match this folder; select the exact space before launching its native Assistant.");
+    space = matching[0];
+  }
+  const here = typeof file.here === "string" && file.here ? file.here : "local";
+  let pick: Record<string, unknown> = {};
+  for (const [label, layer] of [["everywhere", file.everywhere], ["machine", machines[here]], ["space", space]] as const) {
+    const role = record(layer, label).coordinator;
+    if (role !== undefined && role !== null) pick = { ...pick, ...record(role, `${label}.coordinator`) };
+  }
+  let kind = pick.agent;
+  if (kind === undefined && pick.argv === undefined) return null;
+  if (kind === undefined && Array.isArray(pick.argv) && typeof pick.argv[0] === "string")
+    kind = pick.argv[0].split("/").pop();
+  if (kind === "claude" || kind === "codex") return null;
+  if (typeof kind !== "string" || !isNative(kind)) throw new Error(`Unsupported Assistant runtime: ${String(kind)}`);
+  const supported = ["agent", "model", "effort", "profile", "hermesHome", "fast", "perm", "argv"];
+  for (const key of Object.keys(pick)) if (!supported.includes(key)) throw new Error(`Unsupported native Assistant setting: ${key}`);
+  const payload: Record<string, unknown> = {};
+  for (const key of ["model", "effort", "profile", "hermesHome"]) {
+    const field = pick[key];
+    if (field !== undefined && field !== null && typeof field !== "string") throw new Error(`Native Assistant ${key} must be a string.`);
+    if (field) payload[key] = field;
+  }
+  if (pick.fast || pick.perm) throw new Error("Native Assistant launch preserves its own speed and permission policy.");
+  if (pick.argv !== undefined) {
+    if (!Array.isArray(pick.argv) || !pick.argv.length || !pick.argv.every((word) => typeof word === "string")) throw new Error("Native Assistant argv must be a nonempty string array.");
+    if (pick.argv[0].split("/").pop() === "shepherdr-native-run") {
+      if (pick.argv[1] !== kind || typeof pick.argv[2] !== "string") throw new Error("Native Assistant launcher runtime does not match its role.");
+      const custom: unknown = JSON.parse(pick.argv[2]);
+      Object.assign(payload, record(custom, "native launch payload"));
+    } else {
+      if (pick.argv[0].split("/").pop() !== kind) throw new Error("Native Assistant argv runtime does not match its role.");
+      payload.nativeArgs = pick.argv.slice(1);
+      payload.revivable = false;
+    }
+  }
+  payload.message = [options.words, options.message].filter(Boolean).join("\n\n");
+  if (options.files?.length) payload.files = options.files;
+  return { argv: ["shepherdr-native-run", kind, JSON.stringify(payload)], kind };
+}
+
 /** The web's id for the space the window made: Herdr already answers another machine's as "<machine>/<id>" (its
  *  ids are qualified, as its tabs'); kept as it is, never "<machine>/<machine>/<id>" (SHEP-56: the page then waited
  *  for a space that never came). */
@@ -127,8 +193,14 @@ export async function newSpace(hub: Hub, opts: { machine: string | null; path: s
   // Settings › Window › Assistant in new spaces off: it opens without one
   if (opts.store.value("coordinator.auto") === false) return machine ? `${machine}/${id}` : id;
   const t = await execTemplate(hub, "assistant", machine);
-  await run(["hc", "run", "--bg", "--keep", "--no-parent", ...(machine ? ["--on", machine] : []), "--cwd", abs,
-    "--label", "herdr.role=coordinator", "--label", `herdr.coordinator.space=${id}`, "--label", `herdr.space=${id}`, t.name]);
-  t.done();
+  try {
+    const native = await nativeAssistantCommand(hub, { space: machine ? `${machine}/${id}` : id, folder: abs, machine, words: t.words, message: "" });
+    const command = native ? ["--label", `herdr.agent=${native.kind}`, "--label", "herdr.runtime.owner=shepherdr", "--", ...native.argv] : [t.name];
+    const result = await run(["hc", "run", "--bg", "--keep", "--no-parent", ...(machine ? ["--on", machine] : []), "--cwd", abs,
+      "--label", "herdr.role=coordinator", "--label", `herdr.coordinator.space=${id}`, "--label", `herdr.space=${id}`, ...command]);
+    if (result.code !== 0) throw new Error(result.err.trim() || "The Assistant did not start.");
+  } finally {
+    t.done();
+  }
   return machine ? `${machine}/${id}` : id;
 }

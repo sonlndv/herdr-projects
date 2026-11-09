@@ -2558,7 +2558,7 @@ class Revive(unittest.TestCase):
                 return json.loads(json.dumps(self.terms[args[1]]))
             raise AssertionError(f"hc {args}")
         self.tasks = {"dev#6": {"id": 6, "state": "running", "agents": []}}
-        for name, value in (("run", hc), ("hc_json", hc_json), ("session_of", lambda pid: self.sessions.get(pid, (None, None))),
+        for name, value in (("run", hc), ("hc_json", hc_json), ("session_of", lambda pid, kind="claude": self.sessions.get(pid, (None, None))),
                             ("task_of", lambda k: self.tasks.get((k.get("labels") or {}).get("herdr.task")))):
             p = mock.patch.object(revive, name, value)
             p.start()

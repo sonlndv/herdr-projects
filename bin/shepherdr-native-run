@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Launch the unmodified native TUI, with exact session isolation and seed admission."""
+import importlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+from shepherdr_native.common import NativeError
+from shepherdr_native.launch import prepare, SESSION_ENV
+
+
+def main():
+    if len(sys.argv) < 3:
+        raise NativeError("Usage: shepherdr-native-run RUNTIME JSON_PAYLOAD [INITIAL_MESSAGE]")
+    kind = sys.argv[1]
+    payload = json.loads(sys.argv[2])
+    if not isinstance(payload, dict):
+        raise NativeError("Native launch payload must be an object")
+    if len(sys.argv) > 3:
+        payload["message"] = "\n\n".join(filter(None, [payload.get("message"), *sys.argv[3:]]))
+    # The holder can inherit an invoking agent's identity; this is a new native owner.
+    for key in SESSION_ENV:
+        os.environ.pop(key, None)
+    launch = prepare(kind, payload)
+    os.environ.update(launch.get("env") or {})
+    if kind in ("omp", "omo") and not launch.get("afterAttach"):
+        os.execvpe(launch["argv"][0], launch["argv"], os.environ)
+    child = subprocess.Popen(launch["argv"])
+    failure = []
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, lambda signum, _frame: child.send_signal(signum) if child.poll() is None else None)
+
+    def seed():
+        backend = importlib.import_module("shepherdr_native." + ("hermes" if kind in ("omh", "hermes") else kind))
+        target = {key: launch[key] for key in ("sessionId", "sessionFile", "hermesHome") if key in launch}
+        target["pid"] = child.pid
+        deadline = time.monotonic() + 60
+        last = None
+        while child.poll() is None and time.monotonic() < deadline:
+            try:
+                state = backend.handle("discover", target)
+                if target.get("sessionId") and state.get("sessionId") != target["sessionId"]:
+                    raise NativeError("Native TUI attached to a different session")
+                if not state.get("sessionId"):
+                    raise NativeError("Native TUI has no confirmed session identity")
+                target["sessionId"] = state["sessionId"]
+                if state.get("sessionFile"):
+                    target["sessionFile"] = state["sessionFile"]
+                break
+            except (NativeError, OSError) as exc:
+                last = exc
+                time.sleep(0.1)
+        else:
+            failure.append(f"The native TUI's exact session did not attach: {last}")
+            print(f"shepherdr-native-run: {failure[-1]}", file=sys.stderr)
+            return
+        initial = launch["afterAttach"]
+        try:
+            config = {k: initial[k] for k in ("model", "effort") if initial.get(k)}
+            if config:
+                backend.handle("configure", {**target, **config})
+            if initial.get("images") and state.get("capabilities", {}).get("images") is not True:
+                raise NativeError("This native session does not expose image prompt admission")
+            if initial.get("message") or initial.get("images"):
+                # Never retry an unconfirmed send: it might already have been admitted.
+                result = backend.handle("send", {**target, "text": initial.get("message", ""), "images": initial.get("images") or []})
+                if result.get("admitted") is not True and result.get("accepted") is not True:
+                    raise NativeError("The native gateway did not confirm admission; the message will not be replayed")
+        except (NativeError, OSError) as exc:
+            failure.append(str(exc))
+            print(f"shepherdr-native-run: Initial message/configuration was not confirmed: {exc}", file=sys.stderr)
+
+    observer = None
+    if launch.get("afterAttach"):
+        observer = threading.Thread(target=seed, daemon=True)
+        observer.start()
+    code = child.wait()
+    if observer:
+        observer.join(timeout=1)
+    return code if code else (1 if failure else 0)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (NativeError, OSError, ValueError) as exc:
+        print(f"shepherdr-native-run: {exc}", file=sys.stderr)
+        sys.exit(1)

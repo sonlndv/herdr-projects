@@ -98,3 +98,11 @@ test("Feedback offers and the repo they file to", () => {
   expect(S.feedbackRepo("not a repo")).toBeNull();
   expect(read("mods/shepherdr-settings/main.js")).toContain("feedbackRow(this, t)");
 });
+
+test("native role choices preserve native policy and do not invent a Claude reviewer", () => {
+  const choices = S.choicesFrom({ omp: { model: "native/model", models: [{ id: "native/model", label: "Native", efforts: ["off"] }] } }, { omp: true });
+  expect(choices.defaults).toMatchObject({ agent: "omp", model: "native/model", perm: null });
+  expect(S.roleSel("reviewer", null, choices, "omp").sel.agent).toBe("omp");
+  expect(S.chooseModel(choices.menus, choices.permDefault, { agent: "claude", perm: "bypassPermissions" }, "omp", "native/model").perm).toBeNull();
+  expect(S.choicesFrom({}, {}).defaults).toBeNull();
+});

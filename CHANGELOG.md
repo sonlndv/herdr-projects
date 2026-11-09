@@ -3,6 +3,10 @@
 ## Unreleased
 
 - The New Space dialog renders safely before an emoji selection exists, including during `herdr-app check`.
+- This fork adds full native OMP, OMO and Hermes / OMH sessions: Chat and Terminal share the execution owner,
+  models come from the native runtime, and supported configuration changes apply without restarting it.
+- Native tools, subagents, DAGs, memory and background work stay native-owned. Decisions use explicit native
+  request ids; unsupported controls stay in Terminal, and uncertain message sends are not automatically replayed.
 - On a Mac, you can talk over the agent in a window voice call to interrupt it, as on the web: the call uses
   Apple's echo cancellation, so the microphone stays open while the agent speaks. Other apps' sound dips slightly
   during a call. If echo cancellation can't run, the call works as before.

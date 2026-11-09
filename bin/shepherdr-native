@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Control an existing native agent session; never start a second session owner."""
+import argparse
+import importlib
+import json
+import sys
+
+from shepherdr_native.common import NativeError
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("runtime", choices=("omp", "omo", "omh", "hermes"))
+    parser.add_argument("operation", choices=("launch", "create", "discover", "state", "history", "models", "send", "interrupt", "configure", "answer", "fork", "close"))
+    parser.add_argument("payload", nargs="?", help="JSON object; omitted: read from stdin")
+    args = parser.parse_args(argv)
+    try:
+        payload = json.loads(args.payload if args.payload is not None else sys.stdin.read() or "{}")
+        if not isinstance(payload, dict):
+            raise NativeError("The native request payload must be a JSON object")
+        if args.operation == "launch":
+            from shepherdr_native.launch import prepare
+            result = prepare(args.runtime, payload)
+        else:
+            module = importlib.import_module("shepherdr_native." + ("hermes" if args.runtime == "omh" else args.runtime))
+            if args.runtime == "omh":
+                payload = {**payload, "runtime": "omh"}
+            result = module.handle(args.operation, payload)
+        if not isinstance(result, dict):
+            raise NativeError("The native adapter returned an invalid response")
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    except (NativeError, ValueError, OSError, ImportError) as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False, separators=(",", ":")))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

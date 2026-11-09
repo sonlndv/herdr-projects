@@ -25,8 +25,8 @@ import { h_flex, v_flex, InputState, Input, VirtualListScrollHandle, v_virtual_l
 import { theme, props, setShared, closeOverlay, home, readTextFile, writeTextFile } from "herdr";
 import { modelSections, parsePicks, pickKey, withPin, withRecent, PICKS_FILE } from "./core/agents.js";
 import { dirs } from "./dirs.js";
+import { isNative } from "./core/native-runtime.js";
 
-const AGENTS = ["claude", "codex"];
 const LEVEL = { minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max", ultra: "Ultra", none: "None" };
 // Sizes, as the chat counts them for the overlay's height (mods/chat openPicker): the model list
 // scrolls past LIST; NOTE is a quiet line (an offline machine's; a new conversation's, two lines).
@@ -97,7 +97,7 @@ export default class ModelMenu extends View {
   }
 
   models() {
-    return AGENTS.flatMap((a) => (this.p.menus?.[a]?.models ?? []).map((m) => ({ ...m, agent: a })));
+    return Object.keys(this.p.menus ?? {}).flatMap((a) => (this.p.menus[a]?.models ?? []).map((m) => ({ ...m, agent: a })));
   }
 
   model(s = this.sel) {
@@ -117,7 +117,7 @@ export default class ModelMenu extends View {
     if (m.agent !== was.agent) {
       // Another agent: its own permission modes; full access stays full access.
       const full = was.perm === "bypassPermissions" || was.perm === "full";
-      next.perm = full ? (m.agent === "claude" ? "bypassPermissions" : "full") : this.p.permDefault?.[m.agent] ?? null;
+      next.perm = full && ["claude", "codex"].includes(m.agent) ? (m.agent === "claude" ? "bypassPermissions" : "full") : this.p.permDefault?.[m.agent] ?? null;
       next.fast = false;
     }
     this.sel = next;
@@ -233,6 +233,8 @@ export default class ModelMenu extends View {
     const fast = Boolean(m?.fast);
     const changes = this.settingsMode ? [] : this.changes();
     const perm = menu?.perms?.find((x) => x.id === this.sel.perm);
+    const applyNative = isNative(this.sel.agent) && this.sel.agent === this.was.agent;
+    const configurable = !applyNative || menu?.capabilities?.configure === true;
     const agents = Object.keys(this.p.menus ?? {});
     const sections = this.sections();
     const rows = sections.flatMap((s) => s.rows);
@@ -277,7 +279,7 @@ export default class ModelMenu extends View {
           .on_item_click((key, cx) => {
             const x = items.find((i) => i.key === key);
             if (!x?.row) return;
-            if (!x.row.typed && this.pressX !== null && this.pressX > this.listW - STAR - 4) this.pin(x.row, cx);
+            if (!x.row.typed && !x.row.nativeDefault && this.pressX !== null && this.pressX > this.listW - STAR - 4) this.pin(x.row, cx);
             else this.pickRow(x.row);
             cx.notify();
           }))
@@ -296,14 +298,16 @@ export default class ModelMenu extends View {
         .child(svg("mods/workspace-chrome/chevron-right.svg").size(12).flex_none().text_color(t.dim))))
       // another agent can't carry this conversation on: said before the press, not after
       .when(newChat, (el) => el.child(quiet(`${this.p.menus?.[this.sel.agent]?.name ?? "It"} starts a new conversation. This one stays in ${this.p.menus?.[this.was.agent]?.name ?? "its old agent"}’s history.`, 2 * NOTE)))
+      .when(Boolean(menu?.error), (el) => el.child(quiet(menu.error, 2 * NOTE)))
       // its machine out of reach: said once a change is chosen; the button still tries
       .when(changes.length > 0 && Boolean(offline), (el) => el.child(quiet(`${offline} is offline. Try again once it’s back.`)))
-      .when(changes.length > 0, (el) => el.child(div().min_h(FOOT).flex_none().pt(5).child(h_flex().id("restart").w_full().min_h(28).px(10).py(5)
+      .when(changes.length > 0 && !configurable, (el) => el.child(quiet("Change this runtime in its native terminal.")))
+      .when(changes.length > 0 && configurable, (el) => el.child(div().min_h(FOOT).flex_none().pt(5).child(h_flex().id("restart").w_full().min_h(28).px(10).py(5)
         .justify_center().items_center().rounded(7).cursor_pointer().bg(t.solid).text_color(t.solid_foreground).text_size(12.5).font_medium()
         .hover((s) => s.opacity(0.88))
         .on_click((_e, cx) => { cx.stop_propagation(); this.restart(cx); })
         // its words wrap rather than end in …
-        .child(div().text_center().child(`Restart with ${changes.join(" · ")}`)))))
+        .child(div().text_center().child(`${applyNative ? "Apply" : "Restart with"} ${changes.join(" · ")}`)))))
       .when(this.permOpen, (el) => el.child(this.permMenu(t, 5 + (changes.length ? FOOT + (offline ? NOTE : 0) : 0) + (newChat ? 2 * NOTE : 0) + ROW)));
     // The overlay is the menu at its tallest; the menu sits at its bottom, just above the button.
     return v_flex().id("model-menu-area").w(this.p.width ?? 340).h(this.p.height ?? 600).justify_end()
@@ -334,7 +338,7 @@ export default class ModelMenu extends View {
       .child(div().flex_1().min_w(0).truncate().child(x.typed ? `Use ${x.id}` : x.name))
       .when(Boolean(x.typed), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(`${this.p.menus?.[x.agent]?.name ?? x.agent} id`)))
       .child(this.check(t, chosen))
-      .when(!x.typed, (el) => el.child(div().size(STAR).flex_none().flex().items_center().justify_center()
+      .when(!x.typed && !x.nativeDefault, (el) => el.child(div().size(STAR).flex_none().flex().items_center().justify_center()
         .child(svg(x.pinned ? "mods/chat-models/star-on.svg" : "mods/chat-models/star.svg").size(13).text_color(x.pinned ? t.muted : at ? t.dim : t.border))));
   }
 }

@@ -25,6 +25,9 @@ def parent_of(k):
 def is_helper(k, mine=()):
     """hc ls gives no labels: a helper is also told by its parent, another terminal of the same task
     (a worker's parent is its Assistant, never the task's)."""
+    labels = k.get("labels") or {}
+    if labels.get("herdr.runtime.owner") == "native" or labels.get("herdr.native.child"):
+        return True
     return bool(k.get("parent")) and ((k.get("labels") or {}).get("herdr.role") in HELPER_ROLES or parent_of(k) in mine)
 
 
@@ -58,6 +61,48 @@ def agent_running(k):
     if fg:
         return os.path.basename(fg) not in SHELLS
     return bool(k.get("agent")) and k.get("agent") not in SHELLS
+
+
+def runtime_kind(k):
+    from .settings import NATIVE_KINDS, agent_key
+    labels = k.get("labels") or {}
+    kind = labels.get("herdr.agent")
+    if kind in NATIVE_KINDS:
+        return kind
+    for argv in ((k.get("foreground") or {}).get("argv"), k.get("argv")):
+        if argv:
+            kind = agent_key(argv)
+            if kind in NATIVE_KINDS:
+                return kind
+    name = os.path.basename((k.get("foreground") or {}).get("name") or k.get("agent") or "")
+    return name if name in NATIVE_KINDS else None
+
+
+_native_cache = {}
+
+
+def native_state(k):
+    """Observe the exact owning process, never infer settlement from a terminal's idle event."""
+    from .settings import native_request
+    from .base import Fail
+    kind = runtime_kind(k)
+    if not kind:
+        return None
+    pid = (k.get("foreground") or {}).get("pid")
+    key = (kind, pid, k.get("address"))
+    cached = _native_cache.get(key)
+    if cached and now() - cached[0] < 1000:
+        return cached[1]
+    state = {"settled": None, "pendingAsyncWork": None}
+    if pid:
+        try:
+            state = native_request(kind, "state", {"pid": pid, "terminal": k.get("address")})
+        except Fail as exc:
+            state["error"] = str(exc)
+    if len(_native_cache) > 1000:
+        _native_cache.clear()
+    _native_cache[key] = (now(), state)
+    return state
 
 
 def status_of(task, live):
@@ -125,7 +170,7 @@ def task_status(task, live):
         if wait:
             return "working", None, wait
         # Said ready but not at rest yet (SHEP-148): Working until it is, and only then Ready.
-        if live and not_at_rest(task, live):
+        if not_at_rest(task, live):
             return "working", None, None
         return "ready", None, None
     # An agent that hasn't reported yet is starting: working.
@@ -232,6 +277,12 @@ def busy_again(task, live):
 def not_at_rest(task, live):
     """A Ready task's agent still at it: at work in the turn it said ready in, or its own work
     still running (own_work(), its hard signs only: no status line, a question asked doesn't end it)."""
+    if not live:
+        agents = task.get("agents") or []
+        latest = agents[-1] if agents else {}
+        if latest.get("session_owner") == "native":
+            state = latest.get("native") or {}
+            return state.get("settled") is not True or state.get("pendingAsyncWork") is not False
     if any(status_word(k) == "working" and (k.get("labels") or {}).get("herdr.role") != "reviewer" for k in live):
         return True
     return own_work(task, live, ready=True)
@@ -326,7 +377,8 @@ def log_tail(log, size=262144):
 
 
 def agent_log(task, address=None):
-    a = [x for x in task.get("agents") or [] if x.get("log") and (address is None or x.get("address") == address)]
+    a = [x for x in task.get("agents") or [] if x.get("log") and x.get("agent") not in ("omp", "omo", "omh", "hermes")
+         and (address is None or x.get("address") == address)]
     return a[-1]["log"] if a else None
 
 
@@ -736,6 +788,11 @@ def own_work(task, live, ready=False):
     asks nothing, and never for a Ready task (ready: not_at_rest())."""
     for k in live:
         if (k.get("labels") or {}).get("herdr.role") == "reviewer" or status_word(k) == "blocked":
+            continue
+        native = native_state(k)
+        if native is not None:
+            if native.get("working") is True or native.get("settled") is not True or native.get("pendingAsyncWork") is not False:
+                return True
             continue
         address = k.get("address")
         key = (k.get("labels") or {}).get("herdr.task")

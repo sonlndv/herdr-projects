@@ -24,6 +24,7 @@ import time
 
 from .base import addon_off, APP_HOME, ASK_HOME, sync_held, bundle, ENTRY, Fail, guard, HOME, hc_json, layout, now, PACKAGE, run, STORE, WHERE
 from .news import news_send, send_or_hold, typing
+from .agents import runtime_kind
 
 
 # ---- sync: the same task tools on every machine ---------------------------------------------
@@ -133,6 +134,26 @@ def manifest():
     browser = _real(".local/bin/herdr-browser")
     if browser:
         add(".local/bin/herdr-browser", _read(browser), 0o755, [browser])
+    # Native engines remain installed by their own managers. Only the private adapter programs
+    # travel with Shepherdr; credentials, native config and session state never enter this bundle.
+    native = _real(".local/bin/shepherdr-native")
+    if native:
+        root = os.path.dirname(native)
+        target = ".local/share/shepherdr/bin"
+        for name in ("shepherdr-native", "shepherdr-native-run"):
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                add(f"{target}/{name}", _read(path), 0o755, [path])
+                links.append({"path": f".local/bin/{name}", "target": f"{target}/{name}"})
+        package = os.path.join(root, "shepherdr_native")
+        for directory, dirs, names in os.walk(package):
+            dirs[:] = [name for name in dirs if name != "__pycache__"]
+            for name in names:
+                if not name.endswith((".py", ".ts")):
+                    continue
+                path = os.path.join(directory, name)
+                rel = os.path.relpath(path, package)
+                add(f"{target}/shepherdr_native/{rel}", _read(path), 0o644, [path])
     # The chat's question-card hook (SHEP-139): a task worker's own hook (herdr-task _allow) runs it,
     # so a machine that only runs tasks asks on the card too. From Herdr's app home, else the copy
     # a sync left here (this machine passes it on).
@@ -812,6 +833,12 @@ def _deliver(names, hows, address, text):
         time.sleep(5)
     if there(["hc", "send", address, text]).returncode != 0:
         return False
+    try:
+        terminal = json.loads(there(["hc", "get", address, "--json"]).stdout)
+    except (ValueError, TypeError):
+        return True
+    if runtime_kind(terminal):
+        return True
     for i in range(3):
         time.sleep(0.4)
         if "ctrl+enter to send now" in there(["hc", "read", address, "--lines", "40"]).stdout.lower():

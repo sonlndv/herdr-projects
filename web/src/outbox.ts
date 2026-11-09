@@ -18,6 +18,8 @@ export interface Outgoing {
   hold?: boolean
   /** sending: on its way; sent: in (or waiting for the agent), until it comes back; failed: it didn't go through */
   state: 'sending' | 'sent' | 'failed'
+  /** Native admission was attempted: a reload must never replay an unconfirmed native send. */
+  nativeAttempted?: boolean
   /** the agent shows a menu or is starting (or its machine is out of reach): it goes in once it can */
   waiting?: boolean
   /** why it waits, as the server said */

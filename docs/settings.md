@@ -81,6 +81,41 @@ task values a machine set before (the old machine scope) still apply there until
   `everywhere`) and its heartbeat file (`~/.config/herdr-core/autopilot/everywhere.md`) are what Everywhere inherits
   until it's set.
 
+## Native OMP, OMO and Hermes / OMH
+
+This fork adds `omp`, `omo`, `omh` and `hermes` to the agent choices. Install and sign in to the native CLI on the
+machine that runs it, then choose it in Agents for the Assistant, worker or reviewer. No role gets a reduced tool
+set: the native runtime keeps its own models, permissions, memory, extensions, subagents, DAGs and background work.
+The native process remains the execution owner when switching between Chat and Terminal.
+
+New sessions start through `shepherdr-native-run`. OMP and OMO load small observer/control extensions into their
+existing TUI; Hermes / OMH attaches to its canonical profile gateway. The installer includes these bridges and the
+`shepherdr-native` helper. An OMP or OMO terminal started without the bridge needs a new, explicitly started native
+tab before Chat can control it; an update never kills a running native session just to attach.
+
+- **Models:** discovered from the runtime, not a Claude/Codex list. OMP/OMO ids are `provider/model`; Hermes ids are
+  `provider:model`. A native-default choice leaves `--model` unset; it is not a claim about the model running now.
+  Some runtimes need an active exact session before they can return a catalog.
+- **Apply:** supported model and thinking changes configure the existing native session. Unsupported speed and
+  permission controls are not translated into another runtime's flags. A native profile can be recorded in a role's
+  `profile` setting; `hermesHome` selects an exact Hermes profile home.
+- **Decisions:** only explicit, still-open native request ids can be answered. OMP plan reviews are supported;
+  its tool approvals and questions stay in Terminal. OMO's native questions preserve multi-select values. Hermes
+  approval/clarify controls use its gateway; secrets, sudo, browser requests and unrecoverable dialog gaps stay in
+  Terminal. Closing a card never silently approves or denies a native request.
+- **Files:** OMP and Hermes expose native image admission. The OMO TUI does not; attach images using its own
+  terminal workflow. Ordinary attached-file paths remain in the prompt for native tools to read.
+- **Native work:** shown separately from Shepherdr tasks. Native children are not independently revived or
+  rescheduled by Shepherdr. An idle prompt or a final reply is not proof that native background work settled:
+  unknown settlement does not automatically make a task Ready or permit replacing its owner.
+- **Admission:** Chat does not fall back to pasting when a native request fails, and uncertain sends are not
+  automatically replayed. OMP confirms matching native user events; its public API cannot uniquely attribute
+  identical text entered simultaneously in Terminal. Native slash commands belong in Terminal; programmatic
+  OMP/OMO input does not run their slash-command parser.
+
+These adapters currently require Linux process identity checks and the native APIs described above. An unavailable
+bridge or an older native API is reported explicitly; Terminal retains the runtime's full capabilities.
+
 ## Reactions
 
 Agents › Reactions, on by default: every agent reacts to some of your messages with one emoji, as a person would:

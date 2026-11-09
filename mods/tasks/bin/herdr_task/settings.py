@@ -6,11 +6,29 @@ import os
 import re
 import shutil
 
-from .base import Fail, HOME, MAX_RUNNING, WHERE
+from .base import Fail, HOME, MAX_RUNNING, WHERE, APP_HOME, run
 
 
-# What each agent key starts by default. Unknown keys run as themselves; --argv overrides.
-AGENTS = {"claude": ["claude"], "codex": ["codex", "--no-daemon"]}
+NATIVE_KINDS = ("omp", "omo", "omh", "hermes")
+AGENTS = {"claude": ["claude"], "codex": ["codex", "--no-daemon"],
+          **{kind: ["shepherdr-native-run", kind, "{}"] for kind in NATIVE_KINDS}}
+
+
+def native_request(kind, operation, payload):
+    if kind not in NATIVE_KINDS:
+        raise Fail(f"Unsupported native runtime: {kind}")
+    helper = shutil.which("shepherdr-native") or os.path.join(APP_HOME, "bin", "shepherdr-native")
+    try:
+        result = run([helper, kind, operation, json.dumps(payload)])
+    except OSError as exc:
+        raise Fail(f"Native runtime helper is unavailable: {exc}") from exc
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise Fail(f"{kind} returned no valid native {operation} result") from exc
+    if result.returncode or not isinstance(data, dict) or data.get("error"):
+        raise Fail(str(data.get("error") if isinstance(data, dict) else result.stderr) or f"Native {operation} failed")
+    return data
 
 
 # ---- the person's settings ------------------------------------------------------------------
@@ -163,8 +181,13 @@ def argv_for(pick):
     if not pick:
         return None
     if pick.get("argv"):
-        return [str(x) for x in pick["argv"]]
+        return agent_argv(None, json.dumps([str(x) for x in pick["argv"]]))
     agent = pick.get("agent")
+    if agent in NATIVE_KINDS:
+        if pick.get("fast") or pick.get("perm"):
+            raise Fail("Native runtimes preserve their own speed and permission policy")
+        payload = {k: pick[k] for k in ("model", "effort", "profile", "hermesHome") if pick.get(k)}
+        return ["shepherdr-native-run", agent, json.dumps(payload)]
     if agent == "claude":
         a = ["claude"]
         if pick.get("model"):
@@ -226,11 +249,17 @@ def worker_argv(s, task, space=None, agent=None):
 def argv_model(argv):
     """(model, effort) an agent's argv asks for, as argv_for writes them; None where it doesn't."""
     model = effort = None
+    if argv and os.path.basename(argv[0]) == "shepherdr-native-run":
+        try:
+            payload = json.loads(argv[2])
+        except (ValueError, IndexError):
+            return None, None
+        return payload.get("model"), payload.get("effort")
     for i, a in enumerate(argv[:-1]):
         nxt = argv[i + 1]
         if a in ("--model", "-m"):
             model = nxt
-        elif a == "--effort":
+        elif a in ("--effort", "--thinking", "--reasoning"):
             effort = nxt
         elif a in ("-c", "--config") and nxt.startswith("model_reasoning_effort="):
             effort = nxt.split("=", 1)[1].strip("\"'")
@@ -461,6 +490,8 @@ def agent_argv(key, argv_json=None):
         argv = [str(x) for x in argv]
     else:
         argv = list(AGENTS.get(key, [key]))
+    if agent_key(argv) in NATIVE_KINDS and os.path.basename(argv[0]) != "shepherdr-native-run":
+        argv = ["shepherdr-native-run", agent_key(argv), json.dumps({"nativeArgs": argv[1:], "revivable": False})]
     # Codex runs its commands outside hc without --no-daemon.
     if agent_key(argv) == "codex" and "--no-daemon" not in argv:
         argv.append("--no-daemon")
@@ -468,6 +499,10 @@ def agent_argv(key, argv_json=None):
 
 
 def agent_key(argv):
+    if os.path.basename(argv[0]) == "shepherdr-native-run":
+        if len(argv) < 3 or argv[1] not in NATIVE_KINDS:
+            raise Fail("Invalid native runtime launcher arguments")
+        return argv[1]
     return os.path.basename(argv[0])
 
 

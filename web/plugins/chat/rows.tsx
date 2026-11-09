@@ -7,7 +7,7 @@ import clsx from 'clsx'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowRightIcon, ChatBubbleLeftEllipsisIcon, CheckIcon as TickIcon, ChevronDownIcon, ChevronRightIcon, PaperClipIcon } from '@heroicons/react/16/solid'
 import { useCopy } from '@client/copy.ts'
-import { act, has, openTask, registry } from '@client/kernel.ts'
+import { act, has, openTask, registry, useStore } from '@client/kernel.ts'
 import { AutopilotIcon, CheckIcon, CopyIcon, PageIcon, ReplyIcon, SmileIcon, TermIcon } from '@client/ui.tsx'
 import * as CV from '@core/chat-view.js'
 import type { Chat, Message, ReplyQuote } from '@shared/types.ts'
@@ -48,7 +48,8 @@ export const onTerminal = (fn: (chat: string) => void) => void (showTerminal = f
 export function Band({ msg, chat, cli }: { msg: Message; chat: string; cli?: boolean }) {
   const you = msg.who === 'you'
   const { copied, copy } = useCopy()
-  const acts = bandActs(you ? 'user' : 'agent', msg.text, { fork: cli !== false })
+  const runtime = useStore((s) => s.chats[chat]?.runtime)
+  const acts = bandActs(you ? 'user' : 'agent', msg.text, { fork: cli !== false }).filter((a) => !runtime || a !== 'rewind' && (a !== 'fork' || runtime.capabilities.fork))
   const react = has('reactions')
   const pills = msg.reactions?.length ? registry.messageEdge.map(({ View }, i) => <View key={i} msg={msg} chat={{ key: chat } as Chat} />) : null
   const time = clock(msg.at)
@@ -249,8 +250,8 @@ export function Notice({ chat, resume }: { chat: Chat; resume?: () => Promise<un
   const [busy, setBusy] = useState(false)
   const n = chat.notice!
   const task = /\/worker$/.test(chat.key)
-  const title = n === 'opening' ? WORDS.opening : n === 'unsupported' ? WORDS.unsupported : n === 'none' ? WORDS.notFound : task ? WORDS.taskEnded : WORDS.agentEnded
-  const body = n === 'unsupported' ? WORDS.unsupportedBody : n === 'none' ? WORDS.notFoundBody : null
+  const title = n === 'opening' ? WORDS.opening : n === 'unsupported' && chat.runtime ? `${chat.runtime.name}: terminal only` : n === 'unsupported' ? WORDS.unsupported : n === 'none' ? WORDS.notFound : task ? WORDS.taskEnded : WORDS.agentEnded
+  const body = n === 'unsupported' && chat.runtime ? 'This native session does not expose chat history. Continue in the same session in its terminal.' : n === 'unsupported' ? WORDS.unsupportedBody : n === 'none' ? WORDS.notFoundBody : null
   const btn = 'press-dim flex h-7 items-center gap-1.5 rounded-[7px] px-2.5 text-[0.78125rem] font-medium phone:h-10'
   return (
     <div role="status" data-notice={n} className="flex flex-1 flex-col items-center justify-center gap-1.5 px-6 text-center">

@@ -11,6 +11,17 @@
 // JOBS runs on the agent's machine; `run(script, args)` -> Promise<{ stdout }> runs it there (sh -c script x args).
 
 import { cmdWords } from "./chat-log.js";
+import { isNative } from "./native-runtime.js";
+
+// Native work is reported by its owner. Never infer it from Claude output paths or kill guessed descendants.
+export function nativeJobs(state) {
+  return (state?.jobs ?? []).filter((job) => job?.id != null).map((job) => ({
+    id: String(job.id), kind: job.kind === "monitor" ? "monitor" : "shell",
+    label: String(job.label ?? job.name ?? job.description ?? job.id),
+    cmd: String(job.command ?? job.cmd ?? ""), at: job.at ?? job.startedAt ?? 0,
+    status: job.status, native: true, stoppable: false,
+  }));
+}
 
 //   jobs alive <kind> <pid>          "ok", then the agent's process tree as "<pid> <ppid> <args>" (codex) or
 //                                    the output files its processes hold open, one "F <path>" each (claude)
@@ -113,6 +124,7 @@ export class BgJobs {
 
   // The jobs that run now, oldest first: { id, kind: "shell" | "monitor", label, cmd, at, task?, path?, pid? }.
   list(kind, conv) {
+    if (isNative(kind)) return nativeJobs(conv?.native);
     const s = this.seen;
     if (kind === "codex") {
       if (!s?.procs) return [];
@@ -134,6 +146,7 @@ export class BgJobs {
 
   // Stops a job (one of list()'s). Its CLI then tells the agent it ended, as when it stops one itself.
   async stop(run, kind, pid, job) {
+    if (isNative(kind)) throw new Error("Open Terminal to manage native jobs; no native per-job cancellation API is available.");
     const what = kind === "codex" ? job?.pid : job?.task;
     if (!what) return false;
     await run(JOBS, ["jobs", "stop", kind, String(pid), String(what)]);

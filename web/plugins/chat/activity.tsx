@@ -391,12 +391,12 @@ export function WorkingLine({ chatKey }: { chatKey: string }) {
       {waits ? <ClockIcon aria-hidden className="size-3 shrink-0 fill-[var(--fg3)]" /> : <span aria-hidden className="live-dot size-1.5 shrink-0 rounded-full bg-[var(--work)]" />}
       <span className="min-w-0 flex-1 truncate">{stopping ? WORDS.stopping : chat.doing || WORDS.working}</span>
       <span className="shrink-0 font-mono text-[0.71875rem] text-fg3 tabular-nums">{elapsed(secs)}</span>
-      <button type="button" onClick={stop} disabled={stopping}
+      {chat.runtime?.capabilities.interrupt !== false ? <button type="button" onClick={stop} disabled={stopping}
         className="flex h-[22px] shrink-0 items-center gap-1.5 rounded-[6px] px-2 text-[0.75rem] text-fg2 shadow-[inset_0_0_0_1px_var(--line2)] enabled:hover:bg-hover enabled:hover:text-fg disabled:opacity-45 coarse:h-8 phone:h-8">
         <StopIcon aria-hidden className="size-2 shrink-0 fill-current" />
         Stop
         <kbd className="font-sans text-[0.6875rem] text-fg3 pointer-coarse:hidden">Esc</kbd>
-      </button>
+      </button> : null}
     </div>
   )
 }
@@ -610,4 +610,24 @@ export function JobsTag({ chatKey }: { chatKey: string; cli: string }) {
       )}
     </div>
   )
+}
+
+/** Native graph nodes remain native: no task promotion, guessed status, or child-chat ownership. */
+export function NativeWorkPanel({ chatKey }: { chatKey: string }) {
+  const chat = useStore((s) => s.chats[chatKey])
+  const work = chat?.nativeWork ?? []
+  if (!work.length && chat?.runtime?.pendingAsyncWork !== true) return null
+  return <details data-native-work className="mx-auto w-full max-w-read px-5 py-2 text-[0.8125rem] text-fg2">
+    <summary className="cursor-pointer">{chat?.runtime?.name ?? 'Native'} work{work.length ? ` · ${work.length}` : ''}{chat?.runtime?.pendingAsyncWork === true ? ' · background work pending' : ''}</summary>
+    <ul className="flex max-h-[40svh] flex-col gap-2 overflow-auto py-2">
+      {work.map((node) => <li key={node.id} data-native-node={node.id} className="rounded-row border border-line px-3 py-2">
+        <p className="font-medium text-fg">{node.title || node.id}{node.status ? ` · ${node.status}` : ''}</p>
+        <p>{node.kind ? `${node.kind} · ` : ''}{node.id}</p>
+        {node.parentId ? <p>Parent: {node.parentId}</p> : null}
+        {node.dependencies?.length ? <p>Depends on: {node.dependencies.join(', ')}</p> : null}
+        <details><summary className="cursor-pointer">Native details</summary><pre className="overflow-auto whitespace-pre-wrap break-words text-xs">{JSON.stringify(node, null, 2)}</pre></details>
+      </li>)}
+    </ul>
+    <button type="button" className="text-accent" onClick={() => showTerminal(chatKey)}>Open native terminal</button>
+  </details>
 }

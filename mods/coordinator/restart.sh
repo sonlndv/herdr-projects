@@ -38,6 +38,46 @@ space=$(get '.labels["herdr.space"]') tab=$(get '.labels["herdr.tab"]') role=$(g
 # Assistants start from the assistant template (earlier ones from "coordinator").
 case $(get .template) in assistant|coordinator) role=coordinator ;; esac
 cwd=$(get .cwd) app=$(get .status.app) pid=$(get .foreground.pid) created=$(get .created_ms)
+runtime=$(get '.labels["herdr.agent"]')
+case "$runtime" in omp|omo|omh|hermes) ;; *)
+  runtime=$(get '.status.app')
+  case "$runtime" in omp|omo|omh|hermes) ;; *)
+    foreground=$(get '.foreground.name')
+    runtime=${foreground##*/}
+    case "$runtime" in omp|omo|omh|hermes) ;; *)
+      runtime=$(jq -r '(.foreground.argv // .argv // []) | map(select(test("(^|/)(omp|omo|omh|hermes)$"))) | first // "" | split("/") | last' <<<"$info")
+      ;;
+    esac
+    ;;
+  esac
+  ;;
+esac
+case "$runtime" in
+  omp|omo|omh|hermes)
+    helper=${HERDR_APP_HOME:-$HOME/.config/herdr-app}/bin/shepherdr-native
+    target=$(jq -cn --argjson pid "${pid:-0}" --arg terminal "$old" '{pid:$pid,terminal:$terminal}')
+    native=$("$helper" "$runtime" state "$target") || exit 1
+    if [ -z "$argv" ]; then
+      printf '%s\n' "Native session restarts belong to the native terminal; use the model menu to apply configuration without stopping its work." >&2
+      exit 1
+    fi
+    chosen=$(jq -r 'if (.[0] | split("/") | last) == "shepherdr-native-run" then .[1] else "" end' <<<"$argv")
+    if [ "$chosen" = "$runtime" ]; then
+      if jq -e '.[2] | fromjson | (.nativeArgs != null or .revivable == false or .profile != null or .hermesHome != null)' <<<"$argv" >/dev/null; then
+        printf '%s\n' "Custom native launch arguments and profile changes require a new isolated conversation, not replacement of its live owner." >&2
+        exit 1
+      fi
+      config=$(jq -c '.[2] | fromjson | {model,effort} | with_entries(select(.value != null))' <<<"$argv")
+      "$helper" "$runtime" configure "$(jq -cs '.[0] * .[1]' <(printf '%s\n' "$target") <(printf '%s\n' "$config"))" >/dev/null || exit 1
+      printf '%s\n' "$old"
+      exit 0
+    fi
+    if ! jq -e '.settled == true and .pendingAsyncWork == false' <<<"$native" >/dev/null; then
+      printf '%s\n' "Native work is active or its settlement is unknown; its owning terminal cannot be replaced." >&2
+      exit 1
+    fi
+    ;;
+esac
 # A parked agent (behind a chat) has no tab labels: the chat names where it goes instead.
 # A coordinator in Chat mode says where it lives in its own labels (its workers name that tab).
 [ -n "$tab" ] || tab=$(get '.labels["herdr.coordinator.tab"]')
@@ -112,6 +152,7 @@ else
     mapfile -t cmd < <(jq -r '.[]' <<<"$argv")
     [ ${#cmd[@]} -gt 0 ] || exit 1
     key=$(basename "${cmd[0]}")
+    [ "$key" = shepherdr-native-run ] && key=${cmd[1]}
     # Codex runs its commands outside hc without --no-daemon.
     [ "$key" = codex ] && [[ " ${cmd[*]} " != *" --no-daemon "* ]] && cmd+=(--no-daemon)
     line=$(printf '%q ' "${cmd[@]}")
@@ -121,6 +162,10 @@ else
     body=$(awk 'f>=2 {print} /^---[[:space:]]*$/ {f++}' "$tpl")
     msg="$body"$'\n\n'"$handoff"
   fi
+  if [ "${cmd[0]:-}" = shepherdr-native-run ] || [[ "${cmd[0]:-}" = */shepherdr-native-run ]]; then
+    # Deliver through the native launcher's exact new session, never hc's idle-based template injector.
+    new=$(hc run --bg --json --no-parent --cwd "$cwd" "${labels[@]}" --label "herdr.agent=$key" --label "herdr.runtime.owner=shepherdr" -- sh -c "$clean"' exec "$@"' herdr-clean "${cmd[@]}" "$msg" | jq -r '.address // empty')
+  else
   # hc delivers a template's first message once the agent is ready, so the
   # handoff goes in a one-off template, removed once it has started.
   one=herdr-handoff-$$
@@ -134,6 +179,7 @@ else
   if [ -n "$new" ] && [ "$(jq -r '.first_message.sent' <<<"$out")" = false ]; then
     hc wait "$new" --timeout 90 >/dev/null 2>&1
     hc send "$new" "$msg" >/dev/null 2>&1
+  fi
   fi
 fi
 [ -n "$new" ] || exit 1

@@ -6,8 +6,10 @@ import { dirname, join } from "node:path";
 import { appHome, writable } from "./paths.ts";
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { sendBody, steerNow, messageBody, refusal, reactionLine, mentionedIn, taskTag } from "../core/send.js";
+import { sendBody, sendNative, steerNow, messageBody, refusal, reactionLine, mentionedIn, taskTag } from "../core/send.js";
 import { kindOf } from "../core/chat-reader.js";
+import { NATIVE_KINDS, isNative, nativeRequest, nativeTarget, nativeQuestionId, runtimeName } from "../core/native-runtime.js";
+import { nativeState, nativeAnswer } from "./native.ts";
 import { WORDS } from "../core/chat-view.js";
 import * as AGa from "../core/agents.js";
 import { answerCodex } from "./codex-ask.ts";
@@ -17,9 +19,10 @@ const { READ, withMove, withSection, withoutSection, withSectionName, withIcon, 
 import type { Compat } from "./compat.ts";
 import { worktreeAct } from "./worktrees.ts";
 import { noteFailed, once } from "./send-once.ts";
-import { execTemplate } from "./spaces.ts";
+import { execTemplate, nativeAssistantCommand } from "./spaces.ts";
+import type { NativeAssistantCommand } from "./spaces.ts";
 import * as MA from "../core/machine-add.js";
-import { exec } from "./model.ts";
+import { exec, sh as modelSh } from "./model.ts";
 import { closeSaved, renameSaved, orderSaved, withoutSpace, splitId } from "./saved-spaces.ts";
 
 // The window's own space log (lib/spacelog.js): a space the service closed or renamed with no window is traced there too
@@ -38,6 +41,58 @@ const ADDR = /^([\w.-]+\/)?t[0-9a-z]+$/;
 const REF = /^[A-Z][A-Z0-9]*-\d+$/;
 const MACHINE = /^[\w.-]+$/;
 
+function runtimeIO(hub: Hub, compat: Compat, address: string) {
+  const reader = () => compat.reader?.(address);
+  return {
+    hc: asPerson(hub),
+    sh: (script: string, args: string[], on: string | null) => modelSh(hub, script, args, on),
+    sleep: (ms: number) => Bun.sleep(ms),
+    status: () => hub.terminals.get(address)?.status?.state ?? null,
+    target: () => nativeTarget(hub.terminals.get(address), reader()),
+    native: () => reader()?.nativeState ?? reader()?.native,
+    machine: address.includes("/") ? address.split("/")[0] : null,
+  };
+}
+
+async function nativeAction(hub: Hub, compat: Compat, address: string, operation: string, payload: Record<string, unknown> = {}) {
+  const terminal = hub.terminals.get(address), reader = compat.reader?.(address);
+  if (!terminal || terminal.state !== "live") throw new Error("That native agent isn't running.");
+  const kind = kindOf(terminal) ?? reader?.kind;
+  if (!isNative(kind)) throw new Error("That session is not a native runtime.");
+  const io = runtimeIO(hub, compat, address);
+  const target = nativeTarget(terminal, reader);
+  if (!target.sessionId) {
+    if (reader) throw new Error("This native conversation's identity is unavailable; reopen it before controlling it.");
+    const state = await nativeRequest(io, kind, "state", target, io.machine);
+    if (typeof state.sessionId !== "string" || !state.sessionId) throw new Error("The native owner did not confirm its session identity.");
+    target.sessionId = state.sessionId;
+  }
+  return nativeRequest(io, kind, operation, { ...target, ...payload }, io.machine);
+}
+
+/** Readiness probes are retryable; the first native prompt below is admitted only once. */
+async function startedNativeTarget(hub: Hub, compat: Compat, address: string, kind: string) {
+  const io = runtimeIO(hub, compat, address);
+  const deadline = Date.now() + 30_000;
+  let reason = "The native terminal has not published its session yet.";
+  while (Date.now() < deadline) {
+    try {
+      const current = await hc(["get", address, "--json"]);
+      if (current.code !== 0) throw new Error((current.stderr || current.stdout).trim());
+      const terminal: unknown = JSON.parse(current.stdout);
+      const target = nativeTarget(terminal);
+      if (!target.pid) throw new Error("The native terminal has no foreground owner yet.");
+      const state = nativeState(await nativeRequest(io, kind, "state", target, io.machine));
+      if (!state) throw new Error("The native owner has not confirmed its session identity.");
+      return { io, target: { ...target, sessionId: state.sessionId, sessionFile: state.sessionFile } };
+    } catch (error) {
+      reason = error instanceof Error ? error.message : String(error);
+      await Bun.sleep(200);
+    }
+  }
+  throw new Error(`The native Assistant started, but its first message was not sent: ${reason}`);
+}
+
 /** One page's message to its agent, its files' paths after its words. -> { ok, at } once it is in the agent's terminal
  *  (Claude Code's box clear: core/send.js settleBox), or { waiting } held for the agent's turn; else it throws. */
 async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
@@ -46,7 +101,7 @@ async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
   if (!text && !(Array.isArray(b.attachments) && b.attachments.length)) throw new Error("nothing to send");
   const t = hub.terminals.get(a);
   if (!t || t.state !== "live") throw new Error("That agent isn't running.");
-  const io = { hc: asPerson(hub), sleep: (ms: number) => Bun.sleep(ms), status: () => (hub.terminals.get(a) as any)?.status?.state ?? null };
+  const io = runtimeIO(hub, compat, a);
   // files sent with it: their paths after the words, as the window's chat sends them (copied first to another machine)
   const sent: string[] = Array.isArray(b.attachments) ? b.attachments : [];
   // never some of them quietly
@@ -62,6 +117,15 @@ async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
     return landed;
   }));
   const body = [messageBody({ text, quote: typeof b.quote === "string" ? b.quote.slice(0, 2000) : null, tags: typeof b.tags === "string" ? b.tags : "" }), ...files].filter(Boolean).join("\n\n");
+  const kind = kindOf(t);
+  if (isNative(kind)) {
+    const at = Date.now();
+    const result = await sendNative(io, a, kind, body, { files, ...(b.hold ? { delivery: "followUp" } : {}),
+      ...(again ? { again: true } : {}), ...(typeof b.cid === "string" ? { requestId: b.cid.slice(0, 80) } : {}) });
+    if (result.code !== 0) throw new Error(result.stderr || "Native message admission was not confirmed; inspect its native terminal before sending again.");
+    if (typeof b.cid === "string") compat.noteSend?.(a, { cid: b.cid.slice(0, 80), text, files: sent, at });
+    return { ok: true, at };
+  }
   // held on purpose (Ctrl+Enter, a long press): it goes once the agent stops working
   const st = (hub.terminals.get(a) as any)?.status?.state;
   if (b.hold && (st === "working" || st === "blocked")) {
@@ -141,6 +205,7 @@ function firstWhenIdle(hub: Hub, addr: string, text: string) {
   }, 2000);
 }
 
+interface CommandResult { code: number; stdout: string; stderr: string }
 async function run(cmd: string[]) {
   // a program that isn't there (herdr-app on a web-only install) fails as any other: its code, not a throw
   let p: ReturnType<typeof Bun.spawn<"ignore", "pipe", "pipe">>;
@@ -185,14 +250,32 @@ type Known = { kind: string; name: string; installed: boolean; run?: string[] };
  *  their command, then the first two that aren't. Only the window can ask Herdr: it keeps them in its shared
  *  "machines.stats" (lib/machines.js). Without the window, Claude Code and Codex, looked for on that machine. */
 async function knownAgents(hub: Hub, compat: Compat, machine: string | null): Promise<Known[]> {
-  const s = (compat.shared?.value("machines.stats") as any)?.[machine ?? ""];
-  if (Array.isArray(s?.agents) && s.agents.some((a: any) => Array.isArray(a.run)))
-    return [...s.agents.map((a: any) => ({ kind: a.key, name: a.name, installed: true, run: a.run })),
-      ...(Array.isArray(s.others) ? s.others.map((a: any) => ({ kind: a.key, name: a.name, installed: false })) : [])];
-  const AGENTS: Record<string, { name: string; run: string[] }> = { claude: { name: "Claude Code", run: ["claude"] }, codex: { name: "Codex", run: ["codex"] } };
-  const r = await exec(hub, ["sh", "-c", 'for c in "$@"; do command -v "$c" >/dev/null 2>&1 && echo "$c"; done', "agents", ...Object.keys(AGENTS)], machine).catch(() => null);
+  const raw: unknown = compat.shared?.value("machines.stats");
+  const recorded: Known[] = [];
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const rows = raw as Record<string, unknown>;
+    const selected = rows[machine ?? ""];
+    if (selected && typeof selected === "object" && !Array.isArray(selected)) {
+      const stats = selected as Record<string, unknown>;
+      for (const [field, installed] of [["agents", true], ["others", false]] as const) {
+        for (const entry of Array.isArray(stats[field]) ? stats[field] : []) {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+          const agent = entry as Record<string, unknown>;
+          if (typeof agent.key !== "string" || typeof agent.name !== "string") continue;
+          const command = Array.isArray(agent.run) && agent.run.every((part): part is string => typeof part === "string") ? agent.run : undefined;
+          recorded.push({ kind: agent.key, name: agent.name, installed, ...(command ? { run: command } : {}) });
+        }
+      }
+    }
+  }
+  const AGENTS: Record<string, { name: string; run: string[] }> = {
+    claude: { name: "Claude Code", run: ["claude"] }, codex: { name: "Codex", run: ["codex"] },
+    ...Object.fromEntries(NATIVE_KINDS.map((kind) => [kind, { name: runtimeName(kind), run: [kind] }])),
+  };
+  const missing = Object.keys(AGENTS).filter((kind) => !recorded.some((agent) => agent.kind === kind));
+  const r = missing.length ? await exec(hub, ["sh", "-c", 'for c in "$@"; do command -v "$c" >/dev/null 2>&1 && echo "$c"; done', "agents", ...missing], machine).catch(() => null) : null;
   const have = new Set((r?.stdout ?? "").split("\n").filter(Boolean));
-  return Object.entries(AGENTS).map(([kind, a]) => ({ kind, name: a.name, installed: have.has(kind), run: a.run }));
+  return [...recorded, ...missing.map((kind) => ({ kind, name: AGENTS[kind].name, installed: have.has(kind), run: AGENTS[kind].run }))];
 }
 
 export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
@@ -216,6 +299,20 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     if (!item?.questions?.length || item.closed) throw new Error("That question was answered already.");
     const why = await answerCodex(hc, a, item.questions, b);
     if (why) throw new Error(why);
+    return { ok: true };
+  }
+  if (b?.type === "answer" && typeof b.question === "string" && b.question.startsWith("native:")) {
+    const address = chat(b.chat), reader = compat.reader?.(address);
+    const state = nativeState(reader?.nativeState ?? reader?.native);
+    const request = state?.pendingRequests.find((q) => nativeQuestionId(state.sessionId, q.id) === b.question);
+    if (!state || !request) throw new Error("That native question is no longer open.");
+    if (b.terminal === true) {
+      const shown = await run(["herdr-app", "do", "terminal.show", "--terminal", address]);
+      if (shown.code !== 0) throw new Error("Open this agent's native terminal to answer.");
+      return { ok: true, terminal: true };
+    }
+    const answer = nativeAnswer(request, b);
+    await nativeAction(hub, compat, address, "answer", { requestId: request.id, answer });
     return { ok: true };
   }
   if (b?.type === "answer" && typeof b.question === "string") {
@@ -359,7 +456,7 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().split("\n").pop() || "Autopilot didn't change.");
     return { ok: true };
   }
-  if (b?.type === "model-pin" && compat.agents && ["claude", "codex"].includes(b.agent) && typeof b.model === "string" && /^[\w.\[\]-]{1,60}$/.test(b.model)) {
+  if (b?.type === "model-pin" && compat.agents && ["claude", "codex", ...NATIVE_KINDS].includes(b.agent) && typeof b.model === "string" && /^[\w./:@\[\]-]{1,200}$/.test(b.model)) {
     // the model menu's star: pinned to the top of its agent's list (core/agents.js PICKS_FILE, as the window's)
     return { ok: true, picks: (compat.agents as any).pin(b.agent, b.model) };
   }
@@ -369,8 +466,8 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     const a = chat(b.chat), reader = compat.reader?.(a);
     if (b.type === "restart-info") return compat.agents.info(a, reader);
     if (b.type === "model-menu") return { ok: true, menu: await (compat.agents as any).menu(a, reader) };
-    if (!["claude", "codex"].includes(b.kind)) throw new Error("Pick Claude Code or Codex.");
-    const opt = (v: unknown) => (typeof v === "string" && /^[\w.\[\]-]{1,60}$/.test(v) ? v : undefined);
+    if (!["claude", "codex", ...NATIVE_KINDS].includes(b.kind)) throw new Error("Pick an installed agent runtime.");
+    const opt = (v: unknown) => (typeof v === "string" && /^[\w./:@\[\]-]{1,200}$/.test(v) ? v : undefined);
     const next = await compat.agents.restart(a, reader, { kind: b.kind, model: opt(b.model), effort: opt(b.effort), speed: opt(b.speed), perm: opt(b.perm) });
     return { ok: true, terminal: next };
   }
@@ -463,8 +560,16 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     if (b.type === "tab-agents") return { ok: true, agents: known.map(({ kind, name, installed }) => ({ kind, name, installed })) };
     const a = typeof b.kind === "string" ? known.find((x) => x.kind === b.kind && x.installed && x.run?.length) : null;
     if (b.kind != null && !a) throw new Error("Not an agent Shepherdr knows.");
-    const r = await run(["herdr-app", "do", "tab.new", "--space", sp.id, "--folder", sp.folder || "~", ...(a ? ["--name", a.name, "--argv", JSON.stringify(a.run)] : [])]);
+    const command = a && isNative(a.kind) ? AGa.argvFor({ agent: a.kind }, { agent: a.kind }).argv : a?.run;
+    const r = await run(["herdr-app", "do", "tab.new", "--space", sp.id, "--folder", sp.folder || "~", ...(a ? ["--name", a.name, "--argv", JSON.stringify(command)] : [])]);
     if (r.code !== 0) throw new Error("A new tab opens in the Herdr window: it needs the window open.");
+    if (a && isNative(a.kind)) {
+      const opened: unknown = JSON.parse(r.stdout || "{}");
+      if (!opened || typeof opened !== "object" || !("terminal" in opened) || typeof opened.terminal !== "string")
+        throw new Error("The new native tab did not return its terminal identity.");
+      const labelled = await hc(["label", opened.terminal, `herdr.agent=${a.kind}`]);
+      if (labelled.code !== 0) throw new Error("The native tab started but its runtime identity could not be recorded.");
+    }
     return { ok: true };
   }
   if (b?.type === "space-commit" && typeof b.place === "string" && typeof b.message === "string") {
@@ -487,7 +592,16 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     const to = typeof b.kind === "string" ? known.find((x) => x.kind === b.kind && x.installed) : null;
     if (b.kind != null && !to?.run?.length) throw new Error("Not an agent installed there.");
     const assistant = t.labels?.["herdr.role"] === "coordinator" && !t.labels?.["herdr.agent"];
-    const argv = to?.run ?? (assistant ? null : now?.run ?? null);
+    const kind = kindOf(t);
+    if (isNative(kind)) {
+      if (!to) throw new Error("Use the native terminal to restart this session; model changes apply without restarting it.");
+      if (to.kind === kind) return { ok: true };
+      const state = nativeState(await nativeAction(hub, compat, a, "state"));
+      if (state?.settled !== true || state.pendingAsyncWork !== false)
+        throw new Error("Native work is active or its settlement is unknown; its owning terminal cannot be replaced.");
+    }
+    const argv = to && isNative(to.kind) ? AGa.argvFor({ agent: to.kind }, { agent: to.kind }).argv
+      : to?.run ?? (assistant ? null : now?.run ?? null);
     const script = join(appHome(), "mods", "coordinator", "restart.sh");
     if (!existsSync(script)) throw new Error("Switching agents needs Shepherdr's window layout installed.");
     const r = await run(["bash", script, a, ...(argv ? [JSON.stringify(argv)] : [])]);
@@ -518,6 +632,7 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     // the CLI's own rewind on that message, as the window's: Claude Code's /rewind lists the prompts newest last (Up
     // once per later prompt); Codex's Esc Esc browses back from the last (Left). Then its terminal shows it.
     const a = chat(b.chat), t: any = hub.terminals.get(a), r = compat.reader?.(a);
+    if (isNative(kindOf(t))) throw new Error("Use this runtime's native terminal to rewind its conversation.");
     if (t?.status?.state === "working") throw new Error("The agent is working: stop it first, then rewind.");
     const users = (r?.conv?.items ?? []).filter((x: any) => x.kind === "user" && !x.from && !/^\//.test(x.text ?? ""));
     const i = users.findIndex((u: any) => u.id === b.message), back = i < 0 ? 1 : users.length - i;
@@ -533,7 +648,32 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
   if (b?.type === "fork" && typeof b.chat === "string") {
     // a copy of the conversation in a new tab of its space, through the CLI's own fork (the window makes the tab)
     const a = chat(b.chat), t: any = hub.terminals.get(a), r = compat.reader?.(a);
-    const kind = kindOf(t) ?? "claude", session = sessionOf(kind, r?.path ?? null);
+    const kind = kindOf(t) ?? r?.kind;
+    if (isNative(kind)) {
+      const home = r?.nativeState?.hermesHome;
+      if ((kind === "omh" || kind === "hermes") && typeof home !== "string")
+        throw new Error("The owning Hermes profile is unavailable; use its native terminal to fork.");
+      const result = await nativeAction(hub, compat, a, "fork");
+      if (kind === "omh" || kind === "hermes") {
+        if (typeof result.sessionId !== "string" || !result.sessionId)
+          throw new Error("The native fork did not return its exact session identity.");
+        const machine = a.includes("/") ? a.split("/")[0] : null;
+        const ownSpace = ["herdr.space", "herdr.task.space", "herdr.coordinator.space"].map((label) => t?.labels?.[label]).find(Boolean);
+        const space = ownSpace && machine && !ownSpace.includes("/") ? `${machine}/${ownSpace}` : ownSpace;
+        const argv = ["shepherdr-native-run", kind, JSON.stringify({ sessionId: result.sessionId, hermesHome: home })];
+        const opened = await run(["herdr-app", "do", "tab.new", ...(space ? ["--space", space] : []),
+          "--folder", t?.foreground?.cwd ?? t?.cwd ?? "", "--argv", JSON.stringify(argv)]);
+        if (opened.code !== 0) throw new Error(`Native fork ${result.sessionId} exists, but its tab could not open; resume it in its native terminal.`);
+        const tab: unknown = JSON.parse(opened.stdout || "{}");
+        if (!tab || typeof tab !== "object" || !("terminal" in tab) || typeof tab.terminal !== "string")
+          throw new Error(`Native fork ${result.sessionId} opened without a confirmed terminal identity.`);
+        const labelled = await hc(["label", tab.terminal, `herdr.agent=${kind}`]);
+        if (labelled.code !== 0) throw new Error(`Native fork ${result.sessionId} opened, but its runtime identity could not be recorded.`);
+      }
+      return { ok: true, ...result };
+    }
+    if (kind !== "claude" && kind !== "codex") throw new Error("This runtime does not provide a conversation fork.");
+    const session = sessionOf(kind, r?.path ?? null);
     if (!session) throw new Error("This conversation has no saved session to fork.");
     const space = ["herdr.space", "herdr.task.space", "herdr.coordinator.space"].map((k) => t?.labels?.[k]).find(Boolean);
     const res = await run(["herdr-app", "do", "tab.new", ...(space ? ["--space", space] : []), "--folder", t?.foreground?.cwd ?? t?.cwd ?? "", "--argv", JSON.stringify(forkArgv(kind, t?.foreground?.argv ?? t?.argv ?? [], session))]);
@@ -555,7 +695,13 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     const [slot, rec] = Object.entries(slots).find(([, r]) => r && (r.space === sp.id || r.space === bare)) ?? [];
     const text = str(b.text ?? "").trim();
     if (!text) throw new Error("nothing to send");
-    const files = Array.isArray(b.attachments) && !sp.machine ? b.attachments.filter((p: unknown) => typeof p === "string" && p.startsWith(attachDir() + "/") && !p.includes("/../")) : [];
+    const attachments: unknown[] = Array.isArray(b.attachments) ? b.attachments : [];
+    if (attachments.length > MAX_FILES) throw new Error(`At most ${MAX_FILES} files in one message.`);
+    const files = attachments.map((path) => {
+      if (typeof path !== "string" || !path.startsWith(attachDir() + "/") || path.includes("/../"))
+        throw new Error("That file isn't one sent from here.");
+      return path;
+    });
     const task = [text, ...files].join("\n\n");
     // its machine offline: it waits (the web shows it waiting to be reached) and starts once the machine is back
     if (sp.machine && !(await addedMachines()).some((m: any) => m.name === sp.machine && m.state === "connected")) {
@@ -569,15 +715,40 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
         "--label", `herdr.coordinator.space=${bare}`, ...(rec.tab ? ["--label", `herdr.coordinator.tab=${String(rec.tab).split("/").pop()}`] : [])]
       : ["--label", "herdr.role=coordinator", "--label", `herdr.coordinator.space=${bare}`, "--label", `herdr.space=${bare}`];
     const tpl = await execTemplate(hub, "assistant", sp.machine ?? null);
-    const r = await hc(["run", "--bg", "--json", "--no-parent", "--keep", ...(sp.machine ? ["--on", sp.machine] : []), ...(sp.folder ? ["--cwd", sp.folder] : []), ...labels, tpl.name, task]);
-    tpl.done();
+    const stageRemoteFiles = Boolean(sp.machine && files.length);
+    let native: NativeAssistantCommand | null;
+    let r: CommandResult;
+    try {
+      native = await nativeAssistantCommand(hub, {
+        space: sp.id, folder: sp.folder || "", machine: sp.machine ?? null,
+        words: stageRemoteFiles ? "" : tpl.words, message: stageRemoteFiles ? "" : text,
+        files: sp.machine ? [] : files,
+      });
+      r = await hc(["run", "--bg", "--json", "--no-parent", "--keep", ...(sp.machine ? ["--on", sp.machine] : []), ...(sp.folder ? ["--cwd", sp.folder] : []), ...labels,
+        ...(native ? ["--label", `herdr.agent=${native.kind}`, "--", ...native.argv] : [tpl.name, task])]);
+    } finally { tpl.done(); }
     let out: any = {};
     try { out = JSON.parse(r.stdout || "{}"); } catch {}
     if (r.code !== 0 || !out.address) throw new Error((r.stderr || r.stdout).trim().split("\n").pop() || "The Assistant didn't start.");
     // what the person asked, for its chat to show apart from the template (the window's data/chat-first)
     const first = join(appHome(), "data", "chat-first");
     const addr = sp.machine && !String(out.address).includes("/") ? `${sp.machine}/${out.address}` : String(out.address);
-    if (out.first_message?.sent === false && tpl.words) firstWhenIdle(hub, addr, `${tpl.words}\n\n${task}`);
+    if (native && stageRemoteFiles) {
+      const landed = await Promise.all(files.map(async (path) => {
+        const copy = await hc(["put", addr, path, "--json"]);
+        const result: unknown = JSON.parse(copy.stdout || "{}");
+        if (copy.code !== 0 || !result || typeof result !== "object" || !("path" in result) || typeof result.path !== "string")
+          throw new Error("The native Assistant started, but an attachment did not reach its machine; the message was not sent.");
+        return result.path;
+      }));
+      const { io, target } = await startedNativeTarget(hub, compat, addr, native.kind);
+      const sent = await nativeRequest(io, native.kind, "send", {
+        ...target, text: [tpl.words, text, ...landed].filter(Boolean).join("\n\n"), files: landed,
+        ...(typeof b.cid === "string" ? { requestId: b.cid } : {}),
+      }, io.machine);
+      if (sent.admitted !== true && sent.accepted !== true)
+        throw new Error("The native Assistant did not confirm its first message; it will not be replayed automatically.");
+    } else if (!native && out.first_message?.sent === false && tpl.words) firstWhenIdle(hub, addr, `${tpl.words}\n\n${task}`);
     try { mkdirSync(first, { recursive: true }); writeFileSync(writable(join(first, `${String(slot ?? addr).replace(/[^\w.-]/g, "_")}.txt`)), text); } catch {}
     return { ok: true, started: true };
   }
@@ -636,11 +807,17 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
       // Send now on a message in Claude Code's own queue (#662): its Ctrl+Enter, only while its screen offers it
       const a = addr(b.addr), t = hub.terminals.get(a);
       if (!t || t.state !== "live") throw new Error("That agent isn't running.");
-      const io = { hc: asPerson(hub), sleep: (ms: number) => Bun.sleep(ms), status: () => (hub.terminals.get(a) as any)?.status?.state ?? null };
+      if (isNative(kindOf(t))) throw new Error("Use the native terminal to promote queued messages.");
+      const io = runtimeIO(hub, compat, a);
       if (!(await steerNow(io, a))) throw new Error(WORDS.notNow);
       return { ok: true };
     }
     case "stop": {
+      const address = addr(b.addr), terminal = hub.terminals.get(address);
+      if (isNative(kindOf(terminal))) {
+        await nativeAction(hub, compat, address, "interrupt");
+        return { ok: true };
+      }
       const r = await hc(["interrupt", addr(b.addr)]);
       return { ok: r.code === 0 };
     }

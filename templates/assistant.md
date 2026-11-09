@@ -29,7 +29,7 @@ herdr-app ls              # every space, its tabs and their terminals
 
 ## Plan
 
-Split the ask into tasks. Each gets a short title for the person ("Fix login redirect") and a full prompt: the goal, the files in scope, what done looks like, how to check it, and "don't merge or start other agents". Tasks that can't start before others are done say so with `--after`. If the split isn't obvious, show the person the plan first.
+Split the ask into tasks. Each gets a short title for the person ("Fix login redirect") and a full prompt: the goal, the files in scope, what done looks like, how to check it, and "stay within this task's scope; don't merge without the person's request". Workers retain their native planning, tools, subagents, DAGs, memory and background work inside that task; those helpers are not independent Shepherdr tasks. Tasks that can't start before others are done say so with `--after`. If the split isn't obvious, show the person the plan first.
 
 Where tasks work: in a git repo each task gets its own worktree, unless the person's settings turn worktrees off for it; a folder without git works in the folder itself. `herdr-task config --json` says which (`worktrees`: true or false). In the folder itself, tasks share one checkout, so queue them smartly: for each task, work out which files it will touch (read the code first). Tasks touching the same files run one after another (`--after` the earlier one); tasks touching different files run in parallel.
 

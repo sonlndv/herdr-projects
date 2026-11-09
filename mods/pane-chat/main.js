@@ -40,8 +40,14 @@ function folder(cwd) {
   return cwd === h ? "~" : cwd.startsWith(h + "/") ? "~" + cwd.slice(h.length) : cwd;
 }
 
-// Chat reads Claude Code's and Codex's own session logs; other agents have no chat.
-const chatty = (p) => Boolean(p?.terminal) && (["claude-code", "codex"].includes(p.app) || ["claude", "codex"].includes(p.program?.key));
+// Native runtime bridges attach to the exact foreground owner; its terminal remains available for native dialogs.
+const chatty = (p) => {
+  if (!p?.terminal) return false;
+  if (["claude-code", "claude", "codex", "omp", "omo", "omh", "hermes"].includes(p.app) || ["claude", "codex", "omp", "omo", "omh", "hermes"].includes(p.program?.key)) return true;
+  const terminal = terminals().find((t) => t.address === p.terminal);
+  return ["omp", "omo", "omh", "hermes"].includes(terminal?.labels?.["herdr.agent"])
+    && /^(?:python(?:3(?:\.\d+)?)?|node|bun|shepherdr-native-run)$/.test(terminal?.foreground?.name ?? p.program?.key ?? p.app ?? "");
+};
 
 const chatPanes = () => new Set(panes().filter((p) => p.mod === CHAT).map((p) => p.pane));
 // The chat pane showing a terminal, if one is open.

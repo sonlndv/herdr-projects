@@ -30,13 +30,14 @@ import { chatPane, chatLabel } from "./core/spaces.js";
 import * as fs from "fs/promises";
 import { FIND, LOG, Conversation, records, resultText, summary, excerpt, names, pilotLine } from "./core/chat-log.js";
 import { BgJobs } from "./core/bg-jobs.js";
-import { ChatReader } from "./core/chat-reader.js";
+import { ChatReader, KINDS, kindOf } from "./core/chat-reader.js";
+import { isNative, runtimeName } from "./core/native-runtime.js";
 import { preview } from "./core/recipe.js";
 import { words, howAnswered, codexOnScreen, codexSteps } from "./core/asks.js";
 // The rows' words and rules the web app's chat draws by too (core/chat-view.js).
 import { WORDS, clock, bgGroups, subagentsOf, subagentWord, senderName, briefLabel, firstUser, firstKeys, literal, fromName, sentTo, selfName, initialOf, newsWords, resolveArtifacts, unsigned, ownWords, fitThumbs, bandActs, bandOrder, imagesLine, questionsBelow, notSent, published, artifactLine, videoLine, mediaIn, elapsed, reportMsg, doingWords, LOST, lostMessage, shellWord, sessionStarted, sessionFailed } from "./core/chat-view.js";
 // Sending the person's words, as the web app does (core/send.js).
-import { refusal, taskTag, messageBody, replyInstead, steerNow, reactionLine, mentionedIn, sendTyped, SETTLE } from "./core/send.js";
+import { refusal, taskTag, messageBody, replyInstead, steerNow, reactionLine, mentionedIn, sendTyped, sendNative, SETTLE } from "./core/send.js";
 // hc whose send goes as the person, with no caller: never "Another agent" on another machine (SHEP-3, core/person.js).
 import { asPerson } from "./core/person.js";
 import { AskCards, linkCtl } from "./cards.js";
@@ -75,7 +76,6 @@ const PAGE = 200;
 const KEEP = 2000;
 // The conversation's width at most, in px: lines stay readable in a wide pane.
 const COLUMN = 760;
-const KINDS = { "claude-code": "claude", claude: "claude", codex: "codex" };
 const norm = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
 // The role templates' folder on the machine a command runs on (sh -c prefix: $dir).
 const TEMPLATE = 'dir="$HOME/.config/herdr-core/templates"; ';
@@ -583,6 +583,7 @@ export default class Chat extends View {
     this.start = null;
     this.end = 0;
     this.conv = null;
+    this.nativeReader = null;
     // What the agent left running in the background (core/bg-jobs.js), the row opened, and the
     // last lines each printed (job id -> text, while open), the ones being stopped.
     this.bgJobs = new BgJobs();
@@ -603,6 +604,7 @@ export default class Chat extends View {
     this.scroll.release();
     this.dict.cancel();
     if (this.call) await this.hangup();
+    if (this.nativeReader && !this.ended) await this.nativeReader.request("close").catch(() => {});
     if (!this.addr || this.machine) return;
     await exec("sh", ["-c", 'rm -f "$1/open/$2"; for f in "$1/req/$2".*.json; do [ -f "$f" ] && grep -q \'"turn_id"\' "$f" && : > "$1/ans/${f##*/}"; done; true', "x", this.askDir, this.addr]);
   }
@@ -951,6 +953,7 @@ export default class Chat extends View {
 
   // The agent's status. Parked behind this chat it isn't in agents(); the core's word then.
   status() {
+    if (isNative(this.kind)) return this.ended ? null : this.nativeReader?.nativeStatus() ?? null;
     const a = agents().find((x) => x.address === this.addr);
     if (a) return a.status;
     const k = terminals().find((x) => x.address === this.addr);
@@ -1100,6 +1103,23 @@ export default class Chat extends View {
 
   // The agent's process and its log, again every few seconds: a /clear, a resume or a new
   // agent started in the same terminal writes another file.
+  nativeReaderFor(kind) {
+    if (!this.nativeReader || this.nativeReader.addr !== this.addr || this.nativeReader.kind !== kind) {
+      this.nativeReader = new ChatReader({ sh: (script, args, on) => exec("sh", ["-c", script, ...args], { on }) }, this.addr);
+      this.nativeReader.kind = kind;
+    }
+    return this.nativeReader;
+  }
+
+  syncNative(reader) {
+    this.kind = reader.kind;
+    this.path = reader.path;
+    this.conv = reader.conv;
+    this.start = reader.start;
+    this.phase = reader.state === "ready" ? "ready" : reader.state === "missing" ? "native-missing" : "finding";
+    this.error = reader.error;
+  }
+
   async locate(cx) {
     if (this.swapping) return;
     const r = await hc(["get", this.addr, "--json"]);
@@ -1120,7 +1140,10 @@ export default class Chat extends View {
         // Read once from its own log, when the list gave one (read-only, with Resume).
         const log = this.endedLog;
         this.endedLog = null;
-        if (!this.path && log?.path && KINDS[log.kind]) { this.path = log.path; this.kind = KINDS[log.kind]; this.reset(); this.pinned = true; }
+        if (!this.path && log?.path && KINDS[log.kind]) {
+          this.path = log.path; this.kind = KINDS[log.kind]; this.reset(); this.pinned = true;
+          if (isNative(this.kind)) this.nativeReader = new ChatReader({ sh: (script, args, on) => exec("sh", ["-c", script, ...args], { on }) }, this.addr).fixed(log.path, this.kind);
+        }
         else if (!this.conv && !this.path) this.set("ended", cx);
         if (!this.ended) { this.ended = true; cx.notify(); }
         return;
@@ -1138,7 +1161,7 @@ export default class Chat extends View {
     const pane = this.lastPane ?? (this.slot && this.slotRec()?.pane) ?? null;
     if (!this.thread && !this.inner && !this.swapping && !t.labels?.["herdr.chat"] && pane && !panes().some((p) => p.terminal === this.addr)
       && panes().some((p) => p.pane === pane && p.mod === "chat")) await hc(["label", this.addr, `herdr.chat=${chatLabel(pane)}`]);
-    const kind = KINDS[t.status?.app] ?? KINDS[t.foreground?.name];
+    const kind = kindOf(t);
     // Back at its shell because the session it resumed is gone: a new agent starts there.
     if (!kind) { if (!(await this.checkLost(this.addr, cx, t))) this.set("unsupported", cx); return; }
     this.t = t;
@@ -1146,6 +1169,20 @@ export default class Chat extends View {
     this.argv = t.foreground?.argv ?? t.argv ?? null;
     const pid = t.foreground?.pid;
     if (!pid) { if (this.phase !== "ready") this.set("none", cx); return; }
+    if (isNative(kind)) {
+      const reader = this.nativeReaderFor(kind);
+      await reader.locate(t);
+      this.syncNative(reader);
+      if (this.dfltFor !== `${kind}|${pid}` && reader.native) {
+        this.dfltFor = `${kind}|${pid}`;
+        this.cmds = [];
+        cx.spawn(async (cx) => { this.dflt = await agent.defaults(kind, this.machine, reader.target()).catch(() => null); cx.notify(); });
+        cx.spawn(async (cx) => { await this.loadTasks(); await this.loadReach(); if (this.assistant()) await this.loadSpaceTasks(); cx.notify(); });
+      }
+      cx.notify();
+      return;
+    }
+    this.nativeReader = null;
     // What the agent's own settings say (model, effort, speed), once per process.
     if (this.dfltFor !== `${kind}|${pid}`) {
       this.dfltFor = `${kind}|${pid}`;
@@ -1223,6 +1260,24 @@ export default class Chat extends View {
 
   // The newest page first; after that, what the log gained since.
   async pull(cx) {
+    if (this.nativeReader) {
+      const reader = this.nativeReader;
+      try {
+        if (await reader.pull() && reader === this.nativeReader) {
+          this.syncNative(reader);
+          this.results.clear();
+          this.settlePending();
+          this.stick = true;
+          cx.notify();
+        }
+      } catch (error) {
+        reader.error = String(error?.message ?? error);
+        this.error = reader.error;
+        if (!reader.conv) this.phase = "native-missing";
+        cx.notify();
+      }
+      return;
+    }
     if (!this.path) return;
     const path = this.path;
     if (this.start === null) {
@@ -1271,6 +1326,23 @@ export default class Chat extends View {
   // The page before what is shown, when the person reaches the top. The row that was first
   // stays where it was: the list is scrolled back to it once the new rows are in.
   loadEarlier(cx) {
+    if (this.nativeReader) {
+      if (this.loadingEarlier || !this.start) return;
+      this.loadingEarlier = true;
+      const reader = this.nativeReader;
+      const first = this.rows()[Math.max(0, this.range?.start ?? 0)]?.id;
+      cx.spawn(async (cx) => {
+        try {
+          if (await reader.earlier() && reader === this.nativeReader) {
+            this.syncNative(reader);
+            this.anchor = first ? { id: first, until: Date.now() + 3000 } : null;
+            this.reanchor = true;
+          }
+        } catch (error) { this.error = String(error?.message ?? error); }
+        finally { this.loadingEarlier = false; cx.notify(); }
+      });
+      return;
+    }
     if (this.loadingEarlier || !this.start || !this.path) return;
     this.loadingEarlier = true;
     const path = this.path, before = this.start;
@@ -1298,6 +1370,10 @@ export default class Chat extends View {
 
   // An opened tools row shows each call's output, read from the log only now.
   loadResults(row, cx) {
+    if (this.nativeReader) {
+      for (const step of row.steps) if (this.conv?.nativeResults.has(step.id)) this.results.set(step.id, this.conv.nativeResults.get(step.id));
+      return;
+    }
     const want = row.steps.filter((s) => s.out !== undefined && !this.results.has(s.id));
     if (!want.length || !this.path) return;
     for (const s of want) this.results.set(s.id, null);
@@ -1336,10 +1412,10 @@ export default class Chat extends View {
         await this.flag();
         // Its own start screen, while it has no session (or a card is still open).
         const k = this.ownTerminal();
-        if (k && (starting(k) || openCard(this.addr))) { await this.screens.tick(this.addr, k); cx.notify(); }
+        if (!isNative(this.kind) && k && (starting(k) || openCard(this.addr))) { await this.screens.tick(this.addr, k); cx.notify(); }
         // The first message hc couldn't hand over (startAgent): once the agent is idle with no screen to answer.
         if (this.firstSend && k?.turn > 0) this.firstSend = null;
-        if (this.firstSend && k?.status?.state === "idle" && !openCard(this.addr)) {
+        if (!isNative(this.kind) && this.firstSend && k?.status?.state === "idle" && !openCard(this.addr)) {
           const text = this.firstSend;
           this.firstSend = null;
           const sent = await personHc(["send", this.addr, text]).catch(() => null);
@@ -1349,13 +1425,13 @@ export default class Chat extends View {
         this.drainQueue(cx);
         // Dragged to the top with the scrollbar: no wheel said so.
         if (this.start && (this.range?.start ?? 9) <= 1) this.loadEarlier(cx);
-        if (this.error) { this.error = null; cx.notify(); }
+        if (this.error && !isNative(this.kind)) { this.error = null; cx.notify(); }
       } catch (e) {
         this.error = String(e?.message ?? e);
         cx.notify();
       }
       const working = this.status() === "working" || this.pending.length > 0 || starting(this.ownTerminal());
-      if (!this.machine && this.path) {
+      if (!isNative(this.kind) && !this.machine && this.path) {
         // Here: wake on the log's folder changing, and look again now and then anyway.
         const dir = this.path.slice(0, this.path.lastIndexOf("/"));
         // One watch at a time: the folder may stay quiet for hours.
@@ -1378,7 +1454,7 @@ export default class Chat extends View {
     this.pickedTasks = [];
     // Also while the agent asks in its terminal: the words answer it there (deliver()).
     if (!text && !this.files.length) return;
-    const msg = { id: `m${Date.now()}`, text, files: this.files, quote: this.quote };
+    const msg = { id: `m${Date.now()}`, text, files: this.files, quote: this.quote, nativeIdentity: this.nativeReader?.identity };
     this.box.set_value("");
     // If the textarea still adds Enter's new line after this, take it out again.
     cx.timer.after(30, () => { if (!this.box.value().trim()) this.box.set_value(""); });
@@ -1418,7 +1494,7 @@ export default class Chat extends View {
     const st = this.status();
     if (st === "working" || st === "blocked" || this.asks.length || openCard(this.addr) || this.pending.some((p) => !p.failed && !p.late)) return;
     const msg = this.queue.shift();
-    if (msg.raw) personHc(["send", this.addr, msg.text]);
+    if (msg.raw && !isNative(this.kind)) personHc(["send", this.addr, msg.text]);
     else this.deliver(msg, cx);
     this.saveSoon(cx);
     cx.notify();
@@ -1429,6 +1505,7 @@ export default class Chat extends View {
     const mm = !msg.files?.length && /^\/model(?:\s+(\S+))?\s*$/i.exec(msg.text ?? "");
     if (mm) { this.modelCommand(mm[1] ?? null, cx); return; }
     if (this.phase === "fresh") { this.startAgent(msg, cx); return; }
+    if (isNative(this.kind)) { this.deliverNative(msg, cx); return; }
     // The CLI shows its own start screen (a card here): typed words could pick one of its
     // choices, so they wait until it is answered (drainQueue()).
     if (openCard(this.addr)) { this.queue.push(msg); return; }
@@ -1487,6 +1564,116 @@ export default class Chat extends View {
     });
   }
 
+  nativeControls(t) {
+    const controls = v_flex().flex_none().px(18).py(6).gap(6);
+    for (const request of this.nativeReader?.native?.pendingRequests ?? []) {
+      const card = v_flex().gap(4).child(div().text_size(12).text_color(t.blocked)
+        .child(String(request.title ?? request.text ?? request.message ?? "The native runtime is waiting for your decision.")));
+      if (request.detail) card.child(div().text_size(12).text_color(t.muted).truncate().child(String(request.detail)));
+      if (request.answerable === true && this.nativeReader.capabilities.answer === true) {
+        const buttons = h_flex().gap(6);
+        for (const choice of request.choices ?? []) buttons.child(this.button(`native-answer-${request.id}-${choice.id}`,
+          this.nativeAnswerPending?.has(request.id) ? "Applying…" : String(choice.label ?? choice.id),
+          null, "secondary", t, (cx) => this.answerNative(request, choice, cx)));
+        if (request.kind === "question" && request.other === true) buttons.child(this.button(`native-answer-${request.id}-text`,
+          "Send written answer", null, "secondary", t, (cx) => this.answerNative(request, { textAnswer: true }, cx)));
+        card.child(buttons);
+        if (request.kind === "plan" && request.tiers?.length) {
+          this.nativePlanRoles ??= new Map();
+          const tiers = h_flex().gap(6);
+          for (const tier of request.tiers) tiers.child(this.button(`native-tier-${request.id}-${tier.role}`,
+            `${this.nativePlanRoles.get(request.id) === tier.role ? "✓ " : ""}${tier.role} · ${tier.provider}/${tier.model}${tier.thinkingLevel ? ` · ${tier.thinkingLevel}` : ""}`,
+            null, "secondary", t, (cx) => { this.nativePlanRoles.set(request.id, tier.role); cx.notify(); }));
+          card.child(tiers);
+        }
+      }
+      controls.child(card);
+    }
+    return controls.child(h_flex().gap(8).items_center()
+      .child(div().flex_1().text_size(12).text_color(t.muted).child(`${runtimeName(this.kind)} · Native session`))
+      .child(this.button("native-open-terminal", WORDS.openTerminal, "mods/workspace-chrome/terminal.svg", "secondary", t, () => this.toTerminal())));
+  }
+
+  answerNative(request, choice, cx) {
+    const reader = this.nativeReader, identity = reader?.identity;
+    if (!reader?.capabilities.answer || request.answerable !== true) { this.toTerminal(); return; }
+    let answer = choice.value ?? { choice: choice.id };
+    let composed = null;
+    if (choice.textAnswer === true) {
+      if (request.kind !== "question" || request.other !== true) return;
+      composed = this.box.value().trim();
+      if (!composed) { this.box.focus(); return; }
+      answer = composed;
+    }
+    if (request.kind === "plan" && choice.id === "refine") {
+      const feedback = this.box.value().trim();
+      if (!feedback) { toast({ title: "Feedback needed", body: "Type your plan feedback in the message box, then choose Refine.", level: "info" }); this.box.focus(); return; }
+      answer = { ...(typeof answer === "object" ? answer : { choice: answer }), feedback };
+      composed = feedback;
+    }
+    if (request.kind === "plan" && ["execute", "compact", "keep"].includes(choice.id) && this.nativePlanRoles?.has(request.id)) {
+      answer = { ...(typeof answer === "object" ? answer : { choice: answer }), role: this.nativePlanRoles.get(request.id) };
+    }
+    this.nativeAnswerPending ??= new Set();
+    if (this.nativeAnswerPending.has(request.id)) return;
+    this.nativeAnswerPending.add(request.id);
+    cx.spawn(async (cx) => {
+      try {
+        if (reader !== this.nativeReader || reader.identity !== identity) throw new Error("The native conversation changed; this decision was not sent.");
+        await reader.request("answer", { requestId: request.id, answer });
+        if (composed && this.box.value().trim() === composed) this.box.set_value("");
+        await this.locate(cx);
+      } catch (error) { toast({ title: "Native decision not applied", body: plainError(error), level: "error" }); }
+      finally { this.nativeAnswerPending.delete(request.id); cx.notify(); }
+    });
+  }
+
+  deliverNative(msg, cx) {
+    const reader = this.nativeReader;
+    const identity = reader?.identity, target = reader?.target(), native = reader?.native;
+    if (msg.nativeIdentity && msg.nativeIdentity !== identity) {
+      this.box.set_value(msg.text ?? "");
+      toast({ title: "The native session changed", body: "Your message was not sent to the replacement conversation.", level: "info" });
+      return;
+    }
+    if (!reader || this.ended || reader.capabilities.send !== true) {
+      toast({ title: "Open Terminal to continue", body: "This native session has no available message API.", level: "info" });
+      this.box.set_value(msg.text ?? "");
+      return;
+    }
+    if (/^\//.test(msg.text ?? "")) {
+      toast({ title: "Native command", body: "Run this command in the native terminal.", level: "info" });
+      this.box.set_value(msg.text); this.toTerminal(); return;
+    }
+    const body = messageBody({ text: msg.text, quote: msg.quote?.text ?? null, tags: this.taskTags(msg.text) });
+    const pending = { id: `pending-${msg.id}`, text: msg.text, files: [], paths: [], sent: body, match: norm(msg.text).slice(0, 60) || null, at: Date.now(), msg };
+    this.pending.push(pending);
+    cx.spawn(async (cx) => {
+      try {
+        // Native images are content blocks, not pasted paths that a terminal might interpret as input.
+        const images = [];
+        const files = [];
+        for (const file of msg.files ?? []) {
+          if (file.image) {
+            const ext = String(file.path).split(".").pop()?.toLowerCase();
+            const mimeType = ({ png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" })[ext];
+            if (!mimeType) throw new Error("This image format must be sent in the native terminal.");
+            images.push({ data: (await fs.readFile(file.path)).toString("base64"), mimeType });
+          } else files.push(file);
+        }
+        const paths = files.length ? await attach.deliver(files, this.addr, this.machine) : [];
+        pending.sent = [body, ...paths].filter(Boolean).join("\n\n");
+        if (reader !== this.nativeReader || identity !== reader.identity) throw new Error("The native conversation changed before the message was sent.");
+        const result = await sendNative({ ...this.sendIo(cx), target, native }, this.addr, reader.kind, pending.sent, { images, requestId: msg.id });
+        if (result.code !== 0) {
+          pending.failed = refusal(result).message;
+          pending.uncertain = result.uncertain;
+        } else pending.delivered = true;
+      } catch (error) { pending.failed = String(error?.message ?? error); }
+      cx.notify();
+    });
+  }
+
   // The agent waits on its own dialog in the terminal (a question, a permission): Esc closes it
   // (Claude Code hears the person declined it; Codex stops), then the words go as a message,
   // once it takes typing again.
@@ -1496,11 +1683,13 @@ export default class Chat extends View {
 
   // What core/send.js needs from here: hc, a sleep, the agent's status now.
   sendIo(cx) {
-    return { hc: personHc, sleep: (ms) => cx.sleep(ms), status: () => this.status() };
+    return { hc: personHc, sleep: (ms) => cx.sleep(ms), status: () => this.status(), sh: (script, args, on) => exec("sh", ["-c", script, ...args], { on }),
+      target: () => this.nativeReader?.target(), native: () => this.nativeReader?.native, machine: this.machine };
   }
 
   // A message that didn't go, pressed: it goes again.
   retry(p, cx) {
+    if (p.uncertain) { toast({ title: "Native send not confirmed", body: "Check the native conversation before sending again. This message will not be replayed.", level: "info" }); return; }
     this.pending = this.pending.filter((x) => x !== p);
     this.deliver(p.msg, cx);
   }
@@ -1508,6 +1697,7 @@ export default class Chat extends View {
   // Claude Code's "send now" for a message it queued while working: Ctrl+Enter, only when its
   // screen offers it (pressed on an empty prompt it would do something else).
   steerNow(cx) {
+    if (isNative(this.kind)) return Promise.resolve(false);
     return steerNow(this.sendIo(cx), this.addr);
   }
 
@@ -1532,7 +1722,7 @@ export default class Chat extends View {
   // A held message sent at once (the agent takes it mid-turn).
   sendQueued(msg, cx) {
     this.queue = this.queue.filter((m) => m !== msg);
-    if (msg.raw) personHc(["send", this.addr, msg.text]);
+    if (msg.raw && !isNative(this.kind)) personHc(["send", this.addr, msg.text]);
     else this.deliver(msg, cx);
     this.saveSoon(cx);
   }
@@ -1540,6 +1730,16 @@ export default class Chat extends View {
   // Stop: the CLI's own interrupt. The working line says "Stopping…" until it is idle.
   stop(cx) {
     if (this.status() !== "working") return;
+    if (isNative(this.kind)) {
+      if (!this.nativeReader?.capabilities.interrupt) { this.toTerminal(); return; }
+      this.stopping = true;
+      cx.spawn(async (cx) => {
+        try { await this.nativeReader.request("interrupt"); }
+        catch (error) { this.stopping = false; toast({ title: "Native interrupt failed", body: plainError(error), level: "error" }); }
+        cx.notify();
+      });
+      return;
+    }
     this.stopping = true;
     hc(["interrupt", this.addr]);
     cx.notify();
@@ -1698,7 +1898,7 @@ export default class Chat extends View {
       // session's markers the holder may carry (core/clean-env.js), then execs the agent: hc runs a
       // template's command under sh -c, and where sh is dash (Debian, Ubuntu) the shell would stay
       // the terminal's program, so the chat wouldn't know its CLI.
-      let launch = template, oneOff = null, words = "";
+      let launch = template, oneOff = null, words = "", nativeStart = false, nativeKind = null;
       const st = this.choice?.sel ?? props()?.settings;
       const on = machine ? { on: machine } : {};
       const there = !machine || !st?.agent ? true : (await knownAgents(on).catch(() => []))
@@ -1709,11 +1909,28 @@ export default class Chat extends View {
         const head = /^---\n([\s\S]*?)\n---\n?/.exec(src);
         const body = head ? src.slice(head[0].length) : src;
         const own = /^command:[ \t]*(.+)$/m.exec(head?.[1] ?? "")?.[1]?.trim();
-        const cmd = st?.agent && there ? agent.argvFor(st, { agent: null, argv: [] }).argv.map(q).join(" ") : own;
+        nativeKind = isNative(st?.agent) ? st.agent : /\bshepherdr-native-run\s+(omp|omo|omh|hermes)\b/.exec(own ?? "")?.[1] ?? null;
+        nativeStart = Boolean(nativeKind);
+        const nativeFiles = nativeStart && Boolean(msg?.files?.length);
+        if (nativeStart && (st?.agent === "omo" || /\bshepherdr-native-run\s+omo\b/.test(own ?? "")) && msg?.files?.some((file) => file.image)) {
+          p.failed = "OMO's native TUI has no image-admission API. Open Terminal to attach images.";
+          p.msg = msg;
+          this.phase = "fresh"; cx.notify(); return;
+        }
+        let command = st?.agent && there ? agent.argvFor(st, { agent: null, argv: [] }).argv : null;
+        if (nativeStart && !nativeFiles) {
+          const first = [body.trim(), task].filter(Boolean).join("\n\n");
+          if (command) command = [...command, first];
+        }
+        const cmd = command ? command.map(q).join(" ") : nativeStart && !nativeFiles ? `${own} ${q([body.trim(), task].filter(Boolean).join("\n\n"))}` : own;
+        if (nativeStart && (!there || !body.trim() || !cmd)) {
+          p.failed = "The native launcher and assistant template must be installed on this machine.";
+          this.phase = "fresh"; cx.notify(); return;
+        }
         if (body.trim() && cmd) {
           words = body.trim();
           oneOff = `herdr-${template}-${Date.now().toString(36)}`;
-          const file = `---\nname: ${oneOff}\ndescription: A one-off ${template} start with chosen settings (mods/chat), removed after use.\ncommand: ${cleanCommand(cmd)}\n---\n${body}`;
+          const file = `---\nname: ${oneOff}\ndescription: A one-off ${template} start with chosen settings (mods/chat), removed after use.\ncommand: ${cleanCommand(cmd)}\n---\n${nativeStart ? "" : body}`;
           await exec("sh", ["-c", TEMPLATE + 'printf "%s" "$2" > "$dir/$1.md"', "x", oneOff, file], on);
           launch = oneOff;
         }
@@ -1721,9 +1938,10 @@ export default class Chat extends View {
       const args = ["run", "--bg", "--json", "--no-parent", "--keep", ...(machine ? ["--on", machine] : []), ...(folder ? ["--cwd", folder] : []),
         "--label", `herdr.chat=${chatLabel(pane)}`, "--label", `herdr.chat.slot=${this.slot}`, "--label", `herdr.chat.origin=slot:${this.slot}`,
         "--label", `herdr.role=${this.role}`,
+        ...(nativeKind ? ["--label", `herdr.agent=${nativeKind}`] : []),
         ...(space ? ["--label", `herdr.coordinator.space=${String(space.id).split("/").pop()}`] : []),
         ...(rec?.tab ? ["--label", `herdr.coordinator.tab=${String(rec.tab).split("/").pop()}`] : []),
-        launch, ...(task ? [task] : [])];
+        launch, ...(!nativeStart && task ? [task] : [])];
       const r = await hc(args).catch((e) => ({ code: 1, stderr: String(e?.message ?? e), stdout: "" }));
       if (oneOff) exec("sh", ["-c", TEMPLATE + 'rm -f "$dir/$1.md"', "x", oneOff], on);
       let out = {};
@@ -1734,7 +1952,7 @@ export default class Chat extends View {
       // idle past that screen (follow()), so the Assistant never starts without its instructions.
       const late = (r.code !== 0 || !out.address) && this.slotAgent();
       if (late) out = { address: late, first_message: { sent: false } };
-      if (out.address && out.first_message?.sent === false && words) this.firstSend = [words, task].filter(Boolean).join("\n\n");
+      if (!nativeStart && out.address && out.first_message?.sent === false && words) this.firstSend = [words, task].filter(Boolean).join("\n\n");
       if (r.code !== 0 && !late || !out.address) {
         p.failed = (r.stderr || r.stdout || "It didn't start.").trim();
         if (!msg) toast({ title: `The ${this.role === "coordinator" ? "Assistant" : this.role} didn't start`, body: p.failed, level: "error" });
@@ -1752,7 +1970,17 @@ export default class Chat extends View {
       await this.flag();
       this.phase = "finding";
       this.wasFocused = false;
-      if (machine && msg?.files.length) {
+      if (nativeStart && msg?.files?.length) {
+        // No first prompt was passed to this fresh native owner. Attach its exact bridge before admission.
+        p.msg = { ...msg, text: [words, reply + msg.text].filter(Boolean).join("\n\n") };
+        try {
+          await this.locate(cx);
+          await this.pull(cx);
+          if (!this.nativeReader?.capabilities.send) throw new Error("The native bridge is not ready. Open Terminal to send this first message.");
+          this.pending = this.pending.filter((item) => item !== p);
+          this.deliverNative(p.msg, cx);
+        } catch (error) { p.failed = plainError(error); cx.notify(); }
+      } else if (machine && msg?.files.length) {
         // On another machine: the files once the agent runs there.
         cx.spawn(async () => { const paths = await attach.deliver(msg.files, this.addr, this.machine).catch(() => []); if (paths.length) await personHc(["send", this.addr, paths.join("\n")]); });
       }
@@ -2235,7 +2463,8 @@ export default class Chat extends View {
     if (st === "blocked" || this.asks.length) {
       this.queue.push({ id: `r${Date.now()}`, text: line, files: [], quote: null, raw: true, label: on ? `${emoji} reaction` : `${emoji} reaction removed` });
       this.saveSoon(cx);
-    } else personHc(["send", this.addr, line]);
+    } else if (isNative(this.kind)) this.deliverNative({ id: `r${Date.now()}`, text: line, files: [], quote: null }, cx);
+    else personHc(["send", this.addr, line]);
     cx.notify();
   }
 
@@ -2249,6 +2478,7 @@ export default class Chat extends View {
   // the prompts with the newest last (Up once per later prompt); Codex's Esc Esc browses the
   // transcript from the last prompt (Left once per later prompt). Then the terminal shows it.
   rewind(row, cx) {
+    if (isNative(this.kind)) { this.toTerminal(); return; }
     if (this.status() === "working") { toast({ title: "The agent is working", body: "Stop it first, then rewind.", level: "info" }); return; }
     const users = (this.conv?.items ?? []).filter((x) => x.kind === "user" && !x.from && !/^\//.test(x.text ?? ""));
     const i = users.findIndex((u) => u.id === row.of);
@@ -2269,6 +2499,7 @@ export default class Chat extends View {
 
   // A copy of this conversation, continued in a new tab of this space (the CLI's own fork).
   fork(cx) {
+    if (isNative(this.kind)) { this.toTerminal(); return; }
     const session = agent.sessionOf(this.kind, this.path);
     if (!session) { toast({ title: "Can't fork", body: "This conversation has no saved session.", level: "info" }); return; }
     const tab = panes().find((p) => p.pane === this.myPane())?.tab;
@@ -2606,6 +2837,7 @@ export default class Chat extends View {
 
   current() {
     if (!this.kind) return null;
+    if (isNative(this.kind)) return agent.current(this.kind, this.argv, this.conv?.meta, { ...this.dflt, native: this.nativeReader?.native });
     // A resumed conversation's log names the model it ran on before: until this process
     // writes, its arguments and settings say what it runs on.
     let meta = this.conv?.meta ?? {};
@@ -2618,6 +2850,27 @@ export default class Chat extends View {
   // works out everything it shows (both agents' models, efforts, permission modes) and passes
   // it as props. `at`: where the button was pressed, in the window.
   openPicker(at, cx, name = null) {
+    if (isNative(this.kind)) {
+      const reader = this.nativeReader;
+      this.nativePickIdentity = reader?.identity;
+      if (!reader?.capabilities.configure) { this.toTerminal(); return; }
+      if (this.picking) return;
+      this.picking = true;
+      cx.spawn(async (cx) => {
+        try {
+          const defaults = await agent.defaults(this.kind, this.machine, reader.target());
+          this.dflt = defaults;
+          const current = this.current();
+          const menu = agent.menuFor(this.kind, defaults, current?.model);
+          const menus = { [this.kind]: menu };
+          openOverlay({ mod: "chat-models", kind: "popup", frame: "none", width: 340, height: 500, at: at ?? "pointer",
+            props: { pane: this.pickKey(), width: 340, height: 500, current: { ...current, model: current?.model }, menus,
+              icons: {}, permDefault: { [this.kind]: defaults.mode ?? null }, select: name ? findModel(menus, name) : null } });
+        } catch (error) { toast({ title: "Native models unavailable", body: plainError(error), level: "error" }); }
+        finally { this.picking = false; cx.notify(); }
+      });
+      return;
+    }
     const c = this.current();
     if (!c || this.picking) return;
     this.picking = true;
@@ -2683,6 +2936,18 @@ export default class Chat extends View {
 
   // Restarts the agent with what the picker chose; this chat follows the new one.
   applyPick(pick, cx) {
+    if (isNative(this.kind)) {
+      if (this.nativePickIdentity !== this.nativeReader?.identity) { toast({ title: "The native session changed", body: "Open its model menu again before configuring it.", level: "info" }); return; }
+      if (!this.nativeReader?.capabilities.configure || pick.agent !== this.kind) { this.toTerminal(); return; }
+      cx.spawn(async (cx) => {
+        try {
+          await this.nativeReader.request("configure", { model: pick.model, effort: pick.effort, ...(pick.perm ? { perm: pick.perm } : {}) });
+          await this.locate(cx);
+        } catch (error) { toast({ title: "Native configuration failed", body: plainError(error), level: "error" }); }
+        cx.notify();
+      });
+      return;
+    }
     if (this.thread) return this.switchTask(pick, cx);
     const mine = this.myPane();
     if (this.restarting || !mine || !this.t) return;
@@ -2897,7 +3162,7 @@ export default class Chat extends View {
         // Its actions in a band row under it (the row above draws them too: band()).
         if (x.text) {
           const bar = { id: `b:${x.id}`, of: x.id, target: x.text, text: x.text, side: "user", at: x.at, pills: this.pills(x.id),
-            acts: bandActs("user", x.text, { from: x.from }) };
+            acts: bandActs("user", x.text, { from: x.from, rewind: !isNative(this.kind) }) };
           out[out.length - 1] = { ...out[out.length - 1], bar };
           out.push({ kind: "band", id: `ab:${x.id}`, bar });
         }
@@ -2933,7 +3198,7 @@ export default class Chat extends View {
         // under its last row.
         if (!(working && i === items.length - 1) && out.length > first) {
           const bar = { id: `b:${x.id}`, of: x.id, target: x.text, text: x.text, side: "agent", at: x.at, pills: this.pills(x.id),
-            acts: bandActs("agent", x.text, { fork: Boolean(this.kind) }) };
+            acts: bandActs("agent", x.text, { fork: Boolean(this.kind) && !isNative(this.kind) }) };
           out[out.length - 1] = { ...out[out.length - 1], bar };
           out.push({ kind: "band", id: `ab:${x.id}`, bar });
         }
@@ -3051,7 +3316,7 @@ export default class Chat extends View {
 
   // Whose ask a card shows: the CLI's short name ("Claude asks").
   cli() {
-    return this.kind === "codex" ? "Codex" : "Claude";
+    return isNative(this.kind) ? runtimeName(this.kind) : this.kind === "codex" ? "Codex" : "Claude";
   }
 
   // The empty box's words: whom it writes to.
@@ -3538,6 +3803,7 @@ export default class Chat extends View {
   // live while its agent is, none once it ended or this chat only shows its log.
   jobs() {
     if (!this.conv || this.phase !== "ready" || this.ended || !KINDS[this.kind]) return [];
+    if (this.nativeReader) return this.nativeReader.jobs();
     return this.bgJobs.list(this.kind, this.conv);
   }
 
@@ -3548,6 +3814,7 @@ export default class Chat extends View {
 
   // A look at the agent's processes when one is due, and the open row's last lines again.
   async lookJobs(cx) {
+    if (isNative(this.kind)) return;
     const pid = this.t?.foreground?.pid;
     if (!pid || !this.conv || this.phase !== "ready") return;
     const jobs = this.bgJobs;
@@ -3562,6 +3829,7 @@ export default class Chat extends View {
 
   // Stop on an open row: its processes end; its CLI then tells the agent, as when it stops one.
   stopJob(job, cx) {
+    if (isNative(this.kind)) { this.toTerminal(); return; }
     const pid = this.t?.foreground?.pid;
     if (!pid || this.jobStopping.has(job.id)) return;
     this.jobStopping.add(job.id);
@@ -3625,7 +3893,7 @@ export default class Chat extends View {
             .children(lines === null ? [div().child("Loading…")] : lines.length && lines.some(Boolean) ? lines.map((l) => div().w_full().truncate().child(l || " ")) : [div().child("(no output)")])))
           .child(h_flex().child(stopping
             ? h_flex().h(28).px(10).items_center().text_size(12.5).text_color(t.dim).child(WORDS.stopping)
-            : this.button(`job-stop-${h.id}`, "Stop", "mods/chat/stop.svg", "secondary", t, (cx) => this.stopJob(h, cx)))));
+            : this.button(`job-stop-${h.id}`, h.native ? WORDS.openTerminal : "Stop", h.native ? "mods/workspace-chrome/terminal.svg" : "mods/chat/stop.svg", "secondary", t, (cx) => this.stopJob(h, cx)))));
     };
     // two or more of a kind: one row, opening in place to each of them
     this.groupOpen ??= {};
@@ -4324,6 +4592,7 @@ export default class Chat extends View {
     if (this.phase === "ended" && !this.swapping) return root.child(this.notice(t, WORDS.agentEnded, null, [
       this.button("chat-close", "Close chat", null, "secondary", t, () => this.closeSelf())]));
     const open = this.button("chat-open-terminal", WORDS.openTerminal,"mods/workspace-chrome/terminal.svg", "primary", t, () => this.toTerminal());
+    if (this.phase === "native-missing") return root.child(this.notice(t, "Native conversation unavailable", this.nativeReader?.error ?? "This native session does not expose archived history here.", this.ended ? [] : [open]));
     if (this.phase === "unsupported") return root.child(this.notice(t, WORDS.unsupported, WORDS.unsupportedBody, [open]));
     if (this.phase === "none") return root.child(this.notice(t, WORDS.notFound, WORDS.notFoundBody, [open]));
     if ((this.phase === "finding" && !starting) || this.phase === "ended") return root.child(this.notice(t, this.swapping ? WORDS.restarting : WORDS.opening, null));
@@ -4450,6 +4719,7 @@ export default class Chat extends View {
       .when(this.finding, (el) => el.child(this.findBar(t, rows)))
       .child(body)
       .when(Boolean(this.error), (el) => el.child(div().flex_none().px(18).py(4).text_size(12).text_color(t.blocked).truncate().child(this.error)))
+      .child(isNative(this.kind) && !this.ended ? this.nativeControls(t) : div())
       .child(this.statusLine(t, st) ?? div())
       .child(this.callBar(t) ?? div())
       .child(this.queued(t) ?? div())

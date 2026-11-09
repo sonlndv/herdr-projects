@@ -4,7 +4,7 @@ import json
 
 from .base import now
 from .agents import (
-    agent_running, detail, live_helpers, ask_reason, held_ask, last_words, own_line, own_work, status_word, STATUSES, task_status,
+    agent_running, detail, live_helpers, ask_reason, held_ask, last_words, own_line, own_work, status_word, STATUSES, task_status, native_state, runtime_kind, not_at_rest,
 )
 from .queues import waiting_ext, waiting_for
 
@@ -28,9 +28,10 @@ def view(s, task, live=None):
         v["why"] = own_line(task) or ("Out of review rounds" if task.get("review_out") else None) or last_words(task)
     # Quiet but on its own background work (SHEP-53), or said ready but not at rest yet (SHEP-148):
     # Working; kept on the task for the Tasks panel (core/tasks.js place()).
-    v["own_work"] = (v["status"] == "working" and task["state"] in ("running", "ready") and bool(running)
-                     and all(status_word(k) in ("idle", "done") for k in running)
-                     and own_work(task, running, ready=task["state"] == "ready"))
+    v["own_work"] = (v["status"] == "working" and task["state"] in ("running", "ready")
+                     and ((bool(running) and all(status_word(k) in ("idle", "done") for k in running)
+                           and own_work(task, running, ready=task["state"] == "ready"))
+                          or (not running and task["state"] == "ready" and not_at_rest(task, []))))
     if known:
         progress_clock(s, task, v["status"])
     v["report"] = report_of(task, v["status"])
@@ -39,6 +40,12 @@ def view(s, task, live=None):
                   "tab": (k.get("labels") or {}).get("herdr.tab"), "role": (k.get("labels") or {}).get("herdr.role") or "worker"} for k in running]
     # Its worker's own helper agents (SHEP-54: a reviewer it started as an hc child), for the Tasks panel.
     v["subagents"] = subagents(s.key(task)) if known and running and task["state"] in ("running", "ready") else []
+    v["native"] = [{"address": k["address"], "runtime": runtime_kind(k), **state}
+                   for k in running if (state := native_state(k)) is not None]
+    for owner in v["native"]:
+        for child in owner.get("subagents") or []:
+            v["subagents"].append({**child, "parent": owner["address"], "agent": owner["runtime"],
+                                   "owner": "native", "reschedulable": False})
     v["ref"], v["prefix"] = s.ref(task), s.prefix
     v["waiting_for"] = waiting_for(s, task)
     v["waiting_ext"] = waiting_ext(task)
@@ -50,7 +57,7 @@ def subagent(k):
     lb = k.get("labels") or {}
     st = k.get("status")
     st = st.get("state") if isinstance(st, dict) else st
-    cli = lb.get("herdr.agent") or ("codex" if "codex" in str(k.get("agent") or "") else "claude" if k.get("agent") else None)
+    cli = lb.get("herdr.agent") or runtime_kind(k) or (k.get("agent") if k.get("agent") in ("claude", "codex") else None)
     return {"address": k["address"], "parent": k.get("parent"), "role": lb.get("herdr.role") or "helper", "agent": cli,
             "name": k.get("name"), "status": "working" if st == "working" else "needs" if st == "blocked" else "done",
             "at": k.get("created_ms")}

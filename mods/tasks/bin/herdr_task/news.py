@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from .base import guard, hc_json, now, run, STORE
 from .settings import bare
 from .agents import (
-    agent_log, agent_running, detail, from_person, live_agents, log_tail, said, starting, status_word,
+    agent_log, agent_running, detail, from_person, live_agents, log_tail, runtime_kind, said, starting, status_word,
     STATUSES,
 )
 from .sessions import session_of
@@ -259,7 +259,7 @@ def news_send(address, text, check=True):
     if r.returncode != 0:
         return False
     k = hc_json("get", address) or {}
-    if (k.get("labels") or {}).get("herdr.agent", "claude") == "claude" and status_word(k) == "working":
+    if not runtime_kind(k) and (k.get("labels") or {}).get("herdr.agent", "claude") == "claude" and status_word(k) == "working":
         for i in range(4):
             time.sleep(0.3 if i else 0.15)
             screen = run(["hc", "read", address, "--lines", "40"]).stdout

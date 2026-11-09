@@ -7,6 +7,7 @@ import { StarIcon as StarOutline } from '@heroicons/react/24/outline'
 import { createPortal } from 'react-dom'
 import * as AGc from '@core/agents.js'
 import { taskChatId, type Chat, type Place, type RestartCli, type RestartInfo } from '@shared/types.ts'
+import { permissionForAgent } from '@shared/runtime.ts'
 import { act, setUI, taskOf, useSnap, useStore, useUI } from './kernel.ts'
 import { Dialog } from './rowmenu.tsx'
 import { Pick, shown, Switch, TextValue } from './Settings.tsx'
@@ -39,15 +40,17 @@ export function RestartSheet() {
 
 /** "Restart agent" in a ⋯ menu */
 export function RestartItem({ chat, name, onPick }: { chat: string; name: string; onPick?: () => void }) {
+  const runtime = useStore((s) => s.chats[chat]?.runtime)
   return (
     <MenuItem
       icon={<RestartIcon className={ic} />}
       onClick={() => {
         onPick?.()
-        openRestart(chat, name)
+        if (runtime) openModelMenu(chat)
+        else openRestart(chat, name)
       }}
     >
-      Restart agent…
+      {runtime ? 'Native model settings…' : 'Restart agent…'}
     </MenuItem>
   )
 }
@@ -224,8 +227,8 @@ function SpeedWords({ speed }: { speed: Worn }) {
 
 /* ---------- the window's model button and menu (mods/chat pickParts, mods/chat-models) ---------- */
 
-export type MenuModel = { id: string; name: string; efforts: string[]; defaultEffort?: string | null; fast?: boolean }
-export type AgentMenu = { name: string; models: MenuModel[]; perms?: { id: string; label: string }[] }
+export type MenuModel = { id: string; name: string; efforts: string[]; defaultEffort?: string | null; fast?: boolean; nativeDefault?: boolean }
+export type AgentMenu = { name: string; icon?: string; error?: string; capabilities?: { configure?: boolean; customModel?: boolean }; models: MenuModel[]; perms?: { id: string; label: string }[] }
 type MenuPick = { agent: string; model: string | null; effort: string | null; fast: boolean; perm: string | null }
 type MenuData = { current: MenuPick; menus: Record<string, AgentMenu>; permDefault: Record<string, string>; picks?: Picks; offline?: string | null }
 /** a stretch of the model list (core/agents.js modelSections): Pinned, Recent, All models, or an agent's matches */
@@ -253,7 +256,7 @@ function findModel(menus: Record<string, AgentMenu>, name?: string) {
   return hit ? { agent: hit.agent, model: hit.model } : null
 }
 
-const LEVEL: Record<string, string> = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra', none: 'None' }
+const LEVEL: Record<string, string> = { off: 'Off', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra', none: 'None' }
 
 /** The model list both model menus show (the chat's, below, and Settings' role menu, screens/Role.tsx), made for
  *  any number of agents with any number of models: a tab per agent (only when more than one), a search over every
@@ -273,7 +276,9 @@ export function ModelList({ menus, agent, picks, chosen, disabled, phone, onPick
     if (autoFocus) search.current?.focus({ preventScroll: true })
   }, [])
   const agents = Object.keys(menus)
-  const sections = AGc.modelSections(menus, tab, picks, q) as Section[]
+  const sections = (AGc.modelSections(menus, tab, picks, q) as Section[]).map((s) => ({
+    ...s, rows: s.rows.filter((r) => !r.typed || menus[r.agent]?.capabilities?.customModel !== false),
+  })).filter((s) => s.rows.length)
   const pick = (row: Section['rows'][number]) => {
     onPick(row)
     setTab(row.agent)
@@ -294,7 +299,7 @@ export function ModelList({ menus, agent, picks, chosen, disabled, phone, onPick
             {agents.map((a) => (
               <Tab key={a} fill on={tab === a} onClick={() => { setTab(a); setQ('') }} className="text-[0.75rem]! coarse:text-[0.875rem]! phone:text-[0.875rem]!">
                 <span className="inline-flex items-center gap-1.5 align-middle">
-                  <img src={`agents/${a}.svg`} alt="" aria-hidden className="size-3.5 shrink-0" />
+                  <AgentIcon agent={a} menu={menus[a]} />
                   {menus[a].name}
                 </span>
               </Tab>
@@ -315,23 +320,24 @@ export function ModelList({ menus, agent, picks, chosen, disabled, phone, onPick
             className="h-full min-w-0 flex-1 bg-transparent pr-2 text-fg outline-none placeholder:text-fg3 max-sm:text-base [&::-webkit-search-cancel-button]:appearance-none" />
         </div>
       </div>
+      {menus[tab]?.error ? <p role="status" className="px-[9px] py-2 text-[0.75rem] text-fg3">{menus[tab].error}</p> : null}
       <div ref={list} className={clsx('overflow-y-auto overscroll-contain', phone ? 'max-h-[40dvh]' : 'max-h-[min(300px,36dvh)]')}>
         {sections.length === 0 ? <p className="px-[9px] py-2 text-fg3">No models.</p> : null}
         {sections.map((s) => (
           <div key={s.key} role="group" aria-label={s.title ?? undefined}>
             {s.title ? head(s.title) : null}
             {s.rows.map((x) => {
-              const on = x.agent === chosen.agent && x.id === chosen.model
+              const on = x.agent === chosen.agent && (x.id === chosen.model || x.nativeDefault === true && chosen.model == null)
               return (
                 <div key={`${x.agent}-${x.id}`} className="group relative flex items-center">
                   <button type="button" role="menuitemradio" aria-checked={on} disabled={disabled} className={clsx(row, onPin && 'pr-9')} onClick={() => pick(x)}>
                     {/* the agent's own mark, Herdr's icon (web/public/agents, from the window's icons) */}
-                    <img src={`agents/${x.agent}.svg`} alt="" aria-hidden className="size-3.5 shrink-0" />
+                    <AgentIcon agent={x.agent} menu={menus[x.agent]} />
                     <span className="min-w-0 flex-1 truncate">{x.typed ? <>Use <span className="font-medium">{x.id}</span></> : x.name}</span>
                     {x.typed ? <span className="shrink-0 text-[0.6875rem] text-fg3">{menus[x.agent]?.name} id</span> : null}
                     <span className="grid size-3.5 shrink-0 place-items-center">{on ? <CheckIcon className="size-3.5" /> : null}</span>
                   </button>
-                  {x.typed || disabled || !onPin ? null : (
+                  {x.nativeDefault || x.typed || disabled || !onPin ? null : (
                     <button type="button" tabIndex={-1} aria-label={x.pinned ? `Unpin ${x.name}` : `Pin ${x.name}`} aria-pressed={x.pinned} onClick={() => onPin(x.agent, x.id)}
                       className={clsx('absolute right-0.5 grid size-7 place-items-center rounded-[6px] text-fg3 hover:text-fg coarse:size-10 phone:size-10', !x.pinned && 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 coarse:opacity-60 phone:opacity-60')}>
                       {x.pinned ? <StarSolid className="size-3.5 text-fg2" /> : <StarOutline className="size-3.5" />}
@@ -348,6 +354,11 @@ export function ModelList({ menus, agent, picks, chosen, disabled, phone, onPick
   )
 }
 
+function AgentIcon({ agent, menu }: { agent: string; menu?: AgentMenu }) {
+  const icon = menu?.icon ?? (agent === 'claude' || agent === 'codex' ? `agents/${agent}.svg` : null)
+  return icon ? <img src={icon} alt="" aria-hidden className="size-3.5 shrink-0" /> : <ModelIcon aria-hidden className="size-3.5 shrink-0" />
+}
+
 /** The model menu, for any number of agents with any number of models each: a tab per installed agent (only when more
  *  than one), a search over every agent's models (type anywhere in the menu), the agent's pinned and recent models
  *  on top (core/agents.js modelSections), a star to pin one; then Reasoning (that model's levels), Fast (where the
@@ -360,6 +371,7 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
   const [perms, setPerms] = useState(false)
   const [busy, setBusy] = useState(false)
   const phone = useUI((u) => u.device === 'phone')
+  const runtime = useStore((s) => s.chats[chat]?.runtime)
   const close = () => setMenuOpen(null)
   const models = (d: MenuData) => Object.entries(d.menus).flatMap(([agent, m]) => m.models.map((x) => ({ ...x, agent })))
   const choose = (d: MenuData, was: MenuPick, m: MenuModel & { agent: string }): MenuPick => {
@@ -367,9 +379,7 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
     if (next.effort && !m.efforts.includes(next.effort)) next.effort = null
     if (!m.fast) next.fast = false
     if (m.agent !== was.agent) {
-      // another agent: its own permission modes; full access stays full access
-      const full = was.perm === 'bypassPermissions' || was.perm === 'full'
-      next.perm = full ? (m.agent === 'claude' ? 'bypassPermissions' : 'full') : d.permDefault[m.agent] ?? null
+      next.perm = permissionForAgent(was, m.agent, d.menus[m.agent]?.perms ?? [], d.permDefault[m.agent])
       next.fast = false
     }
     return next
@@ -402,7 +412,8 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
     if (!sel) return
     setBusy(true)
     setError(null)
-    const r = await act({ type: 'restart', chat, kind: sel.agent, model: sel.model ?? '', effort: level(sel) ?? '', speed: sel.fast ? 'fast' : 'normal', perm: sel.perm ?? '' } as never).catch((e: Error) => ({ ok: false, error: e.message }))
+    const native = runtime?.kind === sel.agent
+    const r = await act({ type: 'restart', chat, kind: sel.agent, model: sel.model ?? '', effort: level(sel) ?? '', ...(!native || m?.fast ? { speed: sel.fast ? 'fast' : 'normal' } : {}), ...(menu?.perms?.length ? { perm: sel.perm ?? '' } : {}) } as never).catch((e: Error) => ({ ok: false, error: e.message }))
     setBusy(false)
     if ((r as { ok?: boolean }).ok === false) return setError((r as { error?: string }).error || "The agent didn't restart.")
     close()
@@ -426,6 +437,9 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
   const on = sel ? level(sel) : null
   const perm = sel ? menu?.perms?.find((x) => x.id === sel.perm) : undefined
   const ch = changes()
+  const native = !!runtime && sel?.agent === runtime.kind
+  const configurable = !native || runtime?.capabilities.configure === true
+  const launchDefault = native && m?.nativeDefault === true
   const row = 'flex min-h-[31px] w-full items-center gap-2.5 rounded-[7px] px-[9px] text-left enabled:hover:bg-hover focus-visible:bg-hover focus-visible:outline-none disabled:text-fg3 coarse:min-h-11 phone:min-h-11'
   const head = (t: string) => <div className="px-[9px] pt-2 pb-1 text-[0.6875rem] text-fg3 coarse:text-[0.8125rem] phone:text-[0.8125rem]">{t}</div>
   const sheet = (
@@ -440,9 +454,9 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
           ) : (
             <>
               <ModelList menus={data.menus} agent={sel.agent} picks={data.picks} chosen={sel} phone={phone} onPick={pick}
-                onPin={(agent, id) => void pin(agent, id)} autoFocus={!phone} />
+                disabled={busy || !configurable} onPin={(agent, id) => void pin(agent, id)} autoFocus={!phone} />
               <div className="px-1 py-1"><div className="h-px bg-line" /></div>
-              {m?.efforts?.length ? (
+              {configurable && m?.efforts?.length ? (
                 <>
                   {head('Reasoning')}
                   <div className="px-1 py-[3px]">
@@ -458,7 +472,7 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
                   </div>
                 </>
               ) : null}
-              {m?.fast ? (
+              {configurable && m?.fast ? (
                 <button type="button" role="menuitemcheckbox" aria-checked={sel.fast} className={row} onClick={() => setSel({ ...sel, fast: !sel.fast })}>
                   <SpeedIcon className="size-3.5 shrink-0 text-fg3" />
                   <span className="flex-1">Fast</span>
@@ -468,7 +482,7 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
                   </span>
                 </button>
               ) : null}
-              {menu?.perms?.length ? (
+              {configurable && menu?.perms?.length ? (
                 <button type="button" aria-haspopup="menu" aria-expanded={perms} className={clsx(row, perms && 'bg-hover')} onClick={() => setPerms(!perms)}>
                   <ModeIcon className="size-3.5 shrink-0 text-fg3" />
                   <span className="flex-1">Permissions</span>
@@ -487,6 +501,8 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
                 </div>
               ) : null}
               {error ? <p className="px-[9px] pt-1 text-[0.75rem] text-need-fg">{error}</p> : null}
+              {!configurable ? <p className="px-[9px] py-2 text-[0.75rem] text-fg3">This runtime’s settings are controlled in its native terminal.</p> : null}
+              {launchDefault ? <p className="px-[9px] py-2 text-[0.75rem] text-fg3">Native defaults apply to a new launch, not an observed model or a live-session model change.</p> : null}
               {ch.length ? (
                 <div className="flex flex-col gap-1 pt-[5px]">
                   {/* another agent can't carry this conversation on: said before the press, not after */}
@@ -501,8 +517,8 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
                       {offline} is offline. Try again once it’s back.
                     </p>
                   ) : null}
-                  <button type="button" disabled={busy} onClick={() => void restart()} className="press-dim min-h-7 w-full rounded-[7px] bg-fg px-2.5 py-1 text-balance text-[0.78125rem] font-medium text-bg disabled:opacity-60 coarse:min-h-11 phone:min-h-11 coarse:text-[0.9375rem] phone:text-[0.9375rem]">
-                    {busy ? 'Restarting…' : `Restart with ${ch.join(' · ')}`}
+                  <button type="button" disabled={busy || !configurable || launchDefault} onClick={() => void restart()} className="press-dim min-h-7 w-full rounded-[7px] bg-fg px-2.5 py-1 text-balance text-[0.78125rem] font-medium text-bg disabled:opacity-60 coarse:min-h-11 phone:min-h-11 coarse:text-[0.9375rem] phone:text-[0.9375rem]">
+                    {busy ? native ? 'Applying…' : 'Restarting…' : `${native ? 'Apply' : 'Restart with'} ${ch.join(' · ')}`}
                   </button>
                 </div>
               ) : null}
@@ -519,9 +535,11 @@ function ModelMenu({ chat, typed }: { chat: string; typed?: string }) {
 /** In the message box, as the window's model button: what its agent runs on ("Opus 5.5 · High"), a chevron; it opens
  *  the model menu */
 export function AgentLine({ chatKey, cli }: { chatKey: string; cli: string }) {
-  const words = useStore((s) => s.chats[chatKey]?.agent?.words)
+  const words = useStore((s) => { const c = s.chats[chatKey]; return c?.agent?.words ?? (c?.runtime ? [c.agent?.runtime?.modelLabel ?? c.agent?.runtime?.model ?? c.runtime.name, c.agent?.runtime?.effort].filter(Boolean).join(' · ') : undefined) })
   const open = useMenuOpen()
   const phone = useUI((u) => u.device === 'phone')
+  const runtime = useStore((s) => s.chats[chatKey]?.runtime)
+  if (runtime && !runtime.capabilities.configure) return <span data-agent-line className={agentPick}>{words ?? runtime.name}</span>
   if (!words) return <OldAgentLine chatKey={chatKey} cli={cli} />
   // a narrow chat drops "· 1M" first, as the window's
   const shown = phone ? words.replace(/\s*·\s*1M\b/, '') : words
@@ -547,6 +565,7 @@ function OldAgentLine({ chatKey, cli }: { chatKey: string; cli: string }) {
   const agent = useStore((s) => s.chats[chatKey]?.agent)
   const { model, effort, speed } = runsOn(agent)
   const plan = agent?.planned
+  const runtime = useStore((s) => s.chats[chatKey]?.runtime)
   const planned = plan && `${plan.model ? model!.text : `${cli} default`}${plan.effort ? ` · ${effort!.text}` : ''}, from Settings`
   // Normal that runs is left out: only a speed out of the ordinary earns its place on the line
   // Shepherdr 3: labels start with a capital ("Opus 5.5 · 1M · High")
@@ -566,7 +585,7 @@ function OldAgentLine({ chatKey, cli }: { chatKey: string; cli: string }) {
       type="button"
       data-agent-line
       aria-label={`Runs on: ${words}. Change it`}
-      onClick={() => openRestart(chatKey, taskChatId(chatKey) ?? 'this space', true)}
+      onClick={() => runtime ? openModelMenu(chatKey) : openRestart(chatKey, taskChatId(chatKey) ?? 'this space', true)}
       className={agentPick}
     >
       {planned ? <span className="min-w-0 truncate italic">{planned}</span> : bits.length ? [...seen, ...requested].map(part) : <span className="min-w-0 truncate">{`${cli} · Not known yet`}</span>}
@@ -578,11 +597,16 @@ function OldAgentLine({ chatKey, cli }: { chatKey: string; cli: string }) {
 /** Compact launch controls inside the composer + menu, shared by both chat roles. */
 export function AgentControls({ chatKey, cli }: { chatKey: string; cli: string }) {
   const agent = useStore((s) => s.chats[chatKey]?.agent)
+  const runtime = useStore((s) => s.chats[chatKey]?.runtime)
   const { model, effort, speed } = runsOn(agent)
   const open = () => {
     setUI({ plus: null })
-    openRestart(chatKey, taskChatId(chatKey) ?? 'this space', true)
+    if (runtime) openModelMenu(chatKey)
+    else openRestart(chatKey, taskChatId(chatKey) ?? 'this space', true)
   }
+  if (runtime) return <MenuItem icon={<ModelIcon className={ic} />} onClick={runtime.capabilities.configure ? open : undefined}>
+    {runtime.capabilities.configure ? 'Native model settings…' : 'Model settings: use native terminal'}
+  </MenuItem>
   return <div data-agent-controls>
     {([['Agent', agent ? cli : `${cli} · unknown`, ModeIcon], ['Model', inMenu(model), ModelIcon], ['Effort', inMenu(effort), EffortIcon], ['Speed', inMenu(speed), SpeedIcon]] as const).map(([label, value, Icon]) =>
       <MenuItem key={label} icon={<Icon className={ic} />} aria-label={`${label}: ${value}. Select and restart`} onClick={open}>

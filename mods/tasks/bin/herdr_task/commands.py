@@ -13,11 +13,11 @@ import time
 from .base import Fail, git, guard, now, run, STORE, VERSION
 from .settings import (
     agent_argv, agent_key, bare, merge_policy, review_limits, set_opts, settings_block, settings_for, space_base,
-    task_settings, worker_argv, worktrees_on,
+    task_settings, worker_argv, worktrees_on, argv_model, NATIVE_KINDS, native_request,
 )
 from .agents import (
     agent_log, agent_running, background_jobs, busy_again, detail, fit, LINE_MAX, live_agents, ready_turns, STATUSES, SUMMARY_MAX,
-    WORKING_AGAIN,
+    WORKING_AGAIN, native_state, runtime_kind,
 )
 from .sessions import refresh_sessions
 from .github import (already_merged, drop_branch, finish, gh, github, merged_here, needs_approval, own_work, pr_adopt, pr_open,
@@ -837,8 +837,19 @@ def start_again(s, t, space, key=None, argv_json=None, message=None, parent=None
     keep = prev and prev.get("argv") and (t.get("pick_at") or 0) <= (prev.get("at") or 0)
     argv = agent_argv(None, argv_json) if argv_json else worker_argv(s, t, space, key) if key else \
         (prev["argv"] if keep else worker_argv(s, t, space))
+    if not argv_json and not key and prev and os.path.basename(argv[0]) == "shepherdr-native-run":
+        custom = json.loads(argv[2])
+        if custom.get("nativeArgs") or custom.get("revivable") is False:
+            raise Fail("Custom native arguments cannot be replayed automatically; resume with the native terminal or provide a new explicit --argv")
     same = prev and agent_key(argv) == prev.get("agent")
-    res = resume_argv(argv, prev["session"]) if same and prev.get("session") else None
+    if same and agent_key(argv) in NATIVE_KINDS:
+        old_payload = json.loads(prev["argv"][2]) if os.path.basename(prev["argv"][0]) == "shepherdr-native-run" else {}
+        new_payload = json.loads(argv[2]) if os.path.basename(argv[0]) == "shepherdr-native-run" else {}
+        same = old_payload.get("profile", "default") == new_payload.get("profile", "default") and old_payload.get("hermesHome") == new_payload.get("hermesHome")
+        if new_payload.get("nativeArgs") or new_payload.get("revivable") is False:
+            same = False
+    session = (prev.get("log") if prev.get("agent") in ("omp", "omo") else prev.get("session")) if prev else None
+    res = resume_argv(argv, session) if same and session else None
     if res:
         return launch(s, t, argv, space, message, parent=parent, resume=res), True
     text = handoff(s, t, prev, parent, argv) + (("\n\n" + message) if message else "")
@@ -869,6 +880,37 @@ def cmd_switch(args):
         t = s.find(args.id)
         live = [k for k in map(detail, live_agents(s.key(t))) if agent_running(k)]
         refresh_sessions(s, t, live)
+        if args.argv:
+            wanted = agent_argv(None, args.argv)
+        elif args.agent:
+            wanted = worker_argv(s, t, t.get("space"), args.agent)
+        else:
+            wanted = (last_agent(t) or {}).get("argv") or worker_argv(s, t, t.get("space"))
+        for owner in live:
+            native = native_state(owner)
+            if native is None:
+                continue
+            kind = runtime_kind(owner)
+            current_agent = next((a for a in t.get("agents") or [] if a.get("address") == owner["address"]), None)
+            old_payload = json.loads(current_agent["argv"][2]) if current_agent and os.path.basename(current_agent["argv"][0]) == "shepherdr-native-run" else {}
+            new_payload = json.loads(wanted[2]) if os.path.basename(wanted[0]) == "shepherdr-native-run" else {}
+            same_profile = old_payload.get("profile", "default") == new_payload.get("profile", "default") and old_payload.get("hermesHome") == new_payload.get("hermesHome")
+            if agent_key(wanted) == kind and same_profile and not new_payload.get("nativeArgs") and new_payload.get("revivable") is not False:
+                model, effort = argv_model(wanted)
+                target = {"pid": (owner.get("foreground") or {}).get("pid"), "sessionId": native.get("sessionId"),
+                          "sessionFile": native.get("sessionFile"), "terminal": owner["address"]}
+                changes = {k: value for k, value in (("model", model), ("effort", effort)) if value}
+                if changes:
+                    native_request(kind, "configure", {**target, **changes})
+                if current_agent is not None:
+                    current_agent["argv"] = wanted
+                    s.dirty = True
+                v = view(s, t, live)
+                say(args, {**v, "terminal": owner["address"], "resumed": False, "configured": bool(changes), "ended": []},
+                    f"{s.ref(t)}: {kind} keeps its native session in {owner['address']}")
+                return
+            if native.get("settled") is not True or native.get("pendingAsyncWork") is not False:
+                raise Fail("Native work is still running or its settlement is unknown; its owning terminal cannot be replaced")
         old = live[-1] if live else None
         labels = (old or {}).get("labels") or {}
         space = (labels.get("herdr.task.space") or labels.get("herdr.space") or (bare(args.space) if args.space else None)

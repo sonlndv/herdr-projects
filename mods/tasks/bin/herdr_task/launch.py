@@ -16,7 +16,7 @@ import sys
 import time
 
 from .base import ASK_HOME, ENTRY, Fail, git, hc_json, now, run, WORKTREES
-from .settings import agent_key, ASSISTANT_TEMPLATES, bare, BRANCH_PATTERN, branch_pattern_problem, notes, notes_part, review_limits, settings_block, settings_for
+from .settings import agent_key, NATIVE_KINDS, ASSISTANT_TEMPLATES, bare, BRANCH_PATTERN, branch_pattern_problem, notes, notes_part, review_limits, settings_block, settings_for
 from .templates import instructions
 from .agents import detail, LINE_MAX, live_agents, SUMMARY_MAX
 from .github import finish, remote_of
@@ -217,6 +217,14 @@ def resume_argv(argv, session):
         return argv + ["--resume", session]
     if k == "codex":
         return [argv[0], "resume"] + argv[1:] + [session]
+    if k in NATIVE_KINDS:
+        if os.path.basename(argv[0]) != "shepherdr-native-run":
+            raise Fail("Native task resume requires its native launcher, not a second session owner")
+        payload = json.loads(argv[2])
+        if payload.get("nativeArgs") or payload.get("revivable") is False:
+            raise Fail("Custom native arguments may contain an initial prompt and cannot be replayed; resume with the native terminal")
+        payload["sessionFile" if k in ("omp", "omo") else "sessionId"] = session
+        return [argv[0], k, json.dumps(payload)]
     return None
 
 
@@ -619,6 +627,8 @@ def launch(s, task, argv, space, message=None, parent=None, resume=None, role=No
         cmd = cmd + [message]
     labels = ["--label", f"herdr.task={key}", "--label", f"herdr.task.space={bare(space)}",
               "--label", f"herdr.agent={agent_key(argv)}"]
+    if agent_key(argv) in NATIVE_KINDS:
+        labels += ["--label", "herdr.runtime.owner=shepherdr"]
     ctab = coordinator_tab(parent)
     if ctab:
         labels += ["--label", f"herdr.coordinator={ctab}"]
@@ -636,6 +646,8 @@ def launch(s, task, argv, space, message=None, parent=None, resume=None, role=No
     if r.returncode != 0 or not out.get("address"):
         raise Fail((r.stderr or r.stdout).strip() or "hc run failed")
     a = {"address": out["address"], "agent": agent_key(argv), "argv": argv, "at": now()}
+    if agent_key(argv) in NATIVE_KINDS:
+        a["session_owner"] = "native"
     if parent:
         a["parent"] = parent
     s.dirty = True

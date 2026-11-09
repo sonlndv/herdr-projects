@@ -610,6 +610,8 @@ export class Conversation {
     // Claude Code's queue of what was typed while it works, in order: { id, raw, at, text?,
     // images? } (text only for the person's words; a job's end has a place too).
     this.queue = [];
+    this.nativeResults = new Map();
+    this.nativeCompleted = new Map();
   }
 
   push(item) {
@@ -808,6 +810,92 @@ export class Conversation {
     const said = out.join("\n").trim();
     if (said && this.pilot) this.pilot.said = true;
     return said;
+  }
+
+  // Native history is already the active branch, not a journal to replay as Claude or Codex.
+  // Keep each call/result identity even when a bounded page starts with a result.
+  feedNative(messages) {
+    const contentText = (content) => typeof content === "string" ? content : (Array.isArray(content) ? content : []).filter((b) => b?.type === "text").map((b) => b.text ?? "").join("\n");
+    for (const message of messages) {
+      const id = message.id;
+      const at = typeof message.timestamp === "number" ? message.timestamp : time(message.timestamp);
+      const blocks = typeof message.content === "string" ? [{ type: "text", text: message.content }] : Array.isArray(message.content) ? message.content : [];
+      if (message.model) this.meta.model = message.model;
+      if (message.provider) this.meta.provider = message.provider;
+      if (message.usage) {
+        const usage = message.usage;
+        this.meta.used = usage.totalTokens ?? usage.total_tokens ?? usage.input ?? usage.input_tokens ?? this.meta.used;
+      }
+      if (message.role === "toolResult") {
+        const callId = String(message.toolCallId ?? "");
+        const text = contentText(message.content);
+        if (callId) {
+          this.nativeResults.set(callId, text);
+          this.nativeCompleted.set(callId, { id, isError: Boolean(message.isError) });
+          const step = this.calls.get(callId);
+          if (step) { step.isError = Boolean(message.isError); step.resultId = id; }
+          this.done(callId, id);
+        } else if (text) this.push({ kind: message.isError ? "error" : "agent", id, text, at, toolName: message.toolName });
+        // A failed tool is visible even with its row collapsed, without losing its call association.
+        if (message.isError && callId && text) this.push({ kind: "error", id, text, at, toolCallId: callId, toolName: message.toolName });
+        continue;
+      }
+      if (message.role === "user") {
+        const text = contentText(message.content);
+        const user = claudeUser(text);
+        const images = blocks.filter((b) => b?.type === "image");
+        if (user || images.length) {
+          this.user(id, { ...(user ?? { text: "" }), images: images.length, at });
+          const item = this.items.at(-1);
+          if (item?.id === id && images.some((b) => b.path)) item.paths = images.filter((b) => b.path).map((b) => b.path);
+        }
+        continue;
+      }
+      if (message.role !== "assistant") continue;
+      for (let i = 0; i < blocks.length; i++) {
+        const block = blocks[i];
+        if (block?.type === "text") {
+          const text = this.agentText(block.text ?? "");
+          if (text) this.push({ kind: message.isError ? "error" : "agent", id: i ? `${id}:${i}` : id, text, at });
+        } else if (block?.type === "toolCall") {
+          const callId = String(block.id ?? "");
+          if (!callId) continue;
+          let args = block.arguments ?? {};
+          if (typeof args === "string") { try { args = JSON.parse(args); } catch { args = { arguments: args }; } }
+          const name = String(block.name ?? "tool");
+          // Reuse presentation words where applicable, without assuming native tool policy or lifecycle.
+          const aliases = { bash: "Bash", read: "Read", edit: "Edit", write: "Write", grep: "Grep", glob: "Glob" };
+          const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+          const step = claudeStep(aliases[name] ?? name, { ...input, file_path: input.file_path ?? input.path }) ?? { kind: "tool", line: `Used ${name}`, doing: `Using ${name}` };
+          this.step(callId, `${id}:${i}`, step);
+          const displayed = this.calls.get(callId);
+          if (displayed) { displayed.name = name; displayed.arguments = args; displayed.messageId = id; }
+          const completed = this.nativeCompleted.get(callId);
+          if (completed) {
+            if (displayed) { displayed.isError = completed.isError; displayed.resultId = completed.id; }
+            this.done(callId, completed.id);
+          }
+        }
+      }
+    }
+  }
+
+  applyNative(state) {
+    const hadRequest = Boolean(this.native?.pendingRequests?.length);
+    this.native = state;
+    if (!state) return;
+    if (state.model?.id) this.meta.model = state.model.id;
+    if (state.model?.provider) this.meta.provider = state.model.provider;
+    if (state.model?.contextWindow) this.meta.window = state.model.contextWindow;
+    if (state.thinking != null) this.meta.effort = state.thinking;
+    this.helpers = new Map((state.subagents ?? []).map((agent, i) => [agent.id ?? `native:${i}`, {
+      ...agent, desc: agent.label ?? agent.name ?? agent.description ?? "Native subagent", done: ["done", "completed", "failed", "cancelled"].includes(agent.status),
+    }]));
+    if (state.pendingRequests?.length) { this.doing = "Waiting for you in the terminal"; this.waiting = true; }
+    else if (hadRequest || state.settled === true && state.working !== true && state.pendingAsyncWork !== true) {
+      this.doing = null;
+      this.waiting = false;
+    }
   }
 
   feed(records) {

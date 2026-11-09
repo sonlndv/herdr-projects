@@ -11,9 +11,11 @@ import { exec, hc, appHome } from "herdr";
 // The rules (names, menus, argv) are core/agents.js, shared with the web app.
 import { DEFAULTS, parseDefaults } from "./core/agents.js";
 import { chatLabel } from "./core/spaces.js";
+import { isNative, nativeRequest } from "./core/native-runtime.js";
 export * from "./core/agents.js";
 
-export async function defaults(kind, machine) {
+export async function defaults(kind, machine, target = {}) {
+  if (isNative(kind)) return nativeRequest({ sh: (script, args, on) => exec("sh", ["-c", script, ...args], { on }) }, kind, "models", target, machine);
   const r = await exec("sh", ["-c", DEFAULTS, "defaults", kind], { on: machine }).catch(() => null);
   return parseDefaults(kind, r?.stdout ?? "");
 }
@@ -21,6 +23,7 @@ export async function defaults(kind, machine) {
 // Restarts the agent `t` (hc get's record) with `argv`, parked behind chat pane `pane`.
 // Resolves with the new agent's address.
 export async function restart(t, built, pane) {
+  if ([t.status?.app, t.foreground?.name, t.labels?.["herdr.agent"]].some(isNative)) throw new Error("Native agents must be configured through their live session, not restarted from the chat.");
   const task = t.labels?.["herdr.task"];
   if (task) {
     // herdr-task resumes its own session when the agent stays the same.

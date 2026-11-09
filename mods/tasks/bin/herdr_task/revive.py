@@ -20,7 +20,7 @@ import shlex
 from .base import HOME, hc_json, now, run, SHELLS
 from .agents import agent_running, status_word
 from .sessions import session_of
-from .settings import ASSISTANT_TEMPLATES
+from .settings import ASSISTANT_TEMPLATES, NATIVE_KINDS
 from .launch import CLEAN_ENV
 
 LABEL = "herdr.resume"
@@ -48,17 +48,34 @@ CODEX_VALUE = {"-c", "--config", "-m", "--model", "-p", "--profile", "-s", "--sa
 
 def kind_of(word):
     b = os.path.basename(str(word))
-    return b if b in ("claude", "codex") else None
+    return b if b in ("claude", "codex", *NATIVE_KINDS) else None
 
 
 def base_argv(argv):
     """(kind, argv) for starting the agent in `argv` again: from its claude or codex word on, without
     what resumed a conversation or its first message (core/agents.js freshArgv), or (None, None)."""
     argv = list(argv or [])
+    launcher = next((i for i, word in enumerate(argv) if os.path.basename(str(word)) == "shepherdr-native-run"), None)
+    if launcher is not None:
+        try:
+            kind = argv[launcher + 1]
+            payload = json.loads(argv[launcher + 2])
+        except (ValueError, IndexError):
+            return None, None
+        if kind not in NATIVE_KINDS or not isinstance(payload, dict):
+            return None, None
+        if payload.get("nativeArgs") or payload.get("revivable") is False:
+            return None, None
+        for key in ("sessionId", "sessionFile", "message"):
+            payload.pop(key, None)
+        return kind, [argv[launcher], kind, json.dumps(payload)]
     at = next((i for i, a in enumerate(argv) if (i == 0 or not str(a).startswith("-")) and kind_of(a)), None)
     if at is None:
         return None, None
     kind, rest, out = kind_of(argv[at]), argv[at + 1:], [argv[at]]
+    if kind in NATIVE_KINDS:
+        # A native process not launched by this wrapper belongs to its native supervisor.
+        return None, None
     i = 0
     while i < len(rest):
         a = rest[i]
@@ -94,6 +111,12 @@ def base_argv(argv):
 def resume_argv(kind, argv, session, message=None):
     """argv (base_argv's) resuming `session`, with a first message when given."""
     tail = [message] if message else []
+    if kind in NATIVE_KINDS:
+        payload = json.loads(argv[2])
+        payload["sessionFile" if kind in ("omp", "omo") else "sessionId"] = session
+        if message:
+            payload["message"] = message
+        return [argv[0], kind, json.dumps(payload)]
     if kind == "claude":
         return [*argv, "--resume", session, *tail]
     return [argv[0], "resume", *argv[1:], session, *tail]
@@ -143,6 +166,10 @@ def write_record(k, rec):
 def watched(k):
     """An Assistant or a task's agent (its worker or reviewer): what comes back."""
     labels = k.get("labels") or {}
+    if labels.get("herdr.runtime.owner") == "native" or labels.get("herdr.native.child"):
+        return False
+    if labels.get("herdr.role") in ("helper", "subagent"):
+        return False
     return labels.get("herdr.role") == "coordinator" or k.get("template") in ASSISTANT_TEMPLATES or bool(labels.get("herdr.task"))
 
 
@@ -175,7 +202,7 @@ def record_of(k):
             argv[0] = kind
     if not kind:
         return None
-    sid, log = session_of(pid)
+    sid, log = session_of(pid, kind)
     if not sid:
         return None
     return {"kind": kind, "session": sid, "log": log, "argv": argv, "cwd": fg.get("cwd") or k.get("cwd"),
@@ -234,6 +261,8 @@ def plan(k, rec, running):
     """What to type into `k` now: (how, argv, direct) or None (direct: shell_line's). `running`: the
     sessions agents run here now."""
     labels = k.get("labels") or {}
+    if labels.get("herdr.runtime.owner") == "native" or labels.get("herdr.native.child"):
+        return None
     assistant = labels.get("herdr.role") == "coordinator" or k.get("template") in ASSISTANT_TEMPLATES
     # A task's agent only while its task is at work (Working, or Ready for follow-ups): a finished
     # task's stays a shell, as its end would leave it.
@@ -255,6 +284,12 @@ def plan(k, rec, running):
         rec = task_record(k, task) if task else None
     if rec and rec.get("session") and rec["session"] in running:
         return ("running", None, False)
+    if rec and rec.get("kind") in NATIVE_KINDS and rec.get("session"):
+        session = rec.get("log") if rec["kind"] in ("omp", "omo") else rec["session"]
+        if not session:
+            return None
+        # Reattach only the Shepherdr-launched TUI owner. Native DAG children are never relaunched.
+        return ("resume", resume_argv(rec["kind"], rec["argv"], session), not rec.get("shell"))
     if rec and rec.get("session") and rec.get("log") and os.path.isfile(rec["log"]):
         return ("resume", resume_argv(rec["kind"], rec["argv"], rec["session"], CUT if rec.get("working") else None), not rec.get("shell"))
     # Its session is gone: a new one, with the handover (and an Assistant's role, its template's words).

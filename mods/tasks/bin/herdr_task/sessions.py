@@ -1,4 +1,4 @@
-"""Agent sessions: the Claude Code or Codex session a task's agent runs, so it can resume."""
+"""Exact agent session identity; native journals remain owned by their native engine."""
 
 import json
 import os
@@ -20,9 +20,19 @@ def kids(pid):
     return out
 
 
-def session_of(pid):
+def session_of(pid, kind=None):
     """(session id, log path) of the agent process pid (or a child), as mods/chat/log.js finds it:
     Claude Code names its session in ~/.claude/sessions/<pid>.json; Codex holds its rollout open."""
+    from .settings import NATIVE_KINDS, native_request
+    from .base import Fail
+    if kind in NATIVE_KINDS:
+        try:
+            state = native_request(kind, "discover", {"pid": int(pid)})
+        except (Fail, ValueError, TypeError):
+            return None, None
+        return state.get("sessionId"), state.get("sessionFile")
+    if kind is not None and kind not in ("claude", "codex"):
+        return None, None
     for p in [str(pid)] + kids(pid):
         j = os.path.join(HOME, ".claude", "sessions", p + ".json")
         if os.path.isfile(j):
@@ -65,7 +75,18 @@ def refresh_sessions(s, task, live):
         a = next((a for a in task["agents"] if a["address"] == k["address"]), None)
         if not pid or not a or not agent_running(k):
             continue
-        sid, log = session_of(pid)
+        from .agents import runtime_kind, native_state
+        kind = a.get("agent") or runtime_kind(k)
+        if kind in ("omp", "omo", "omh", "hermes"):
+            state = native_state(k) or {}
+            sid, log = state.get("sessionId"), state.get("sessionFile")
+            snapshot = {key: state.get(key) for key in ("sessionId", "sessionFile", "pid", "revision", "working", "settled", "pendingAsyncWork", "capabilities", "jobs", "subagents")}
+            if a.get("native") != snapshot:
+                a["native"] = snapshot
+                a["session_owner"] = "native"
+                s.dirty = True
+        else:
+            sid, log = session_of(pid, kind)
         if sid and (a.get("session"), a.get("log")) != (sid, log):
             a["session"], a["log"] = sid, log
             s.dirty = True
@@ -134,6 +155,8 @@ def project_dir(folder):
 
 def log_by_session(kind, sid):
     import glob
+    if kind not in ("claude", "codex"):
+        return None
     if kind == "codex":
         found = glob.glob(os.path.join(HOME, ".codex", "sessions", "*", "*", "*", f"rollout-*{sid}.jsonl"))
     else:
@@ -146,7 +169,9 @@ def find_log(a, ref, folders, taken=()):
     or None: by its session when it has one, else the earliest log of its kind that started from
     its launch on (until it ended) and whose first message names its task."""
     import glob
-    kind = "codex" if a.get("agent") == "codex" else "claude"
+    kind = a.get("agent")
+    if kind not in ("claude", "codex"):
+        return a.get("native", {}).get("sessionFile") if kind in ("omp", "omo", "omh", "hermes") else None
     if a.get("session"):
         return log_by_session(kind, a["session"])
     at = a.get("at")

@@ -4,6 +4,7 @@
 import clsx from 'clsx'
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { AgentPick, ModelMenus, SettingRow } from '@shared/types.ts'
+import { permissionForAgent } from '@shared/runtime.ts'
 import { act } from '../kernel.ts'
 import { ModelList } from '../restart.tsx'
 import { CheckIcon, DownIcon, ic, Menu, MenuItem, MenuLabel, MenuSeparator, MenuSwitch, ModeIcon, NextIcon, Primary, SpeedIcon, Tab, Tabs, TextBox } from '../ui.tsx'
@@ -96,17 +97,26 @@ function ModelMenu({ start, up, onClose, save }: { start: AgentPick; up: boolean
       {!data ? <p className={clsx('px-3 py-2 text-fg3', error && 'text-need-fg')}>{error || ST.LOADING_AGENTS}</p> : (
         <>
           <ModelList menus={data.menus as never} agent={sel.agent} picks={picks} chosen={{ agent: sel.agent, model: sel.model ?? null }} autoFocus={!coarse}
-            onPick={(x) => { if (x.agent === sel.agent && x.id === sel.model) return; const menus = withTyped(data.menus, x); if (menus !== data.menus) setData({ ...data, menus }); change(chooseModel(menus, data.permDefault, sel, x.agent, x.id)) }}
+            onPick={(x) => {
+              if (x.agent === sel.agent && x.id === sel.model) return
+              const menus = withTyped(data.menus, x)
+              if (menus !== data.menus) setData({ ...data, menus })
+              const next = chooseModel(menus, data.permDefault, sel, x.agent, x.id)
+              next.perm = permissionForAgent(sel, x.agent, menus[x.agent]?.perms ?? [], data.permDefault[x.agent])
+              change(next)
+            }}
             onPin={(agent, id) => void act({ type: 'model-pin', agent, model: id } as never).then((r: any) => r?.picks && setPicks(r.picks), () => undefined)} />
           <MenuSeparator />
-          <MenuLabel>{MODEL_MENU.reasoning}</MenuLabel>
-          <div className="px-2 pb-1 phone:px-3">
-            <Tabs label={MODEL_MENU.reasoning} className="flex! w-full">
-              {(model?.efforts ?? []).map((e) => (
-                <Tab key={e} fill on={level === e} onClick={() => level !== e && change({ ...sel, effort: e })}>{levelName(e)}</Tab>
-              ))}
-            </Tabs>
-          </div>
+          {model?.efforts.length ? <>
+            <MenuLabel>{MODEL_MENU.reasoning}</MenuLabel>
+            <div className="px-2 pb-1 phone:px-3">
+              <Tabs label={MODEL_MENU.reasoning} className="flex! w-full">
+                {model.efforts.map((e) => (
+                  <Tab key={e} fill on={level === e} onClick={() => level !== e && change({ ...sel, effort: e })}>{levelName(e) ?? e}</Tab>
+                ))}
+              </Tabs>
+            </div>
+          </> : null}
           {fast ? <MenuSwitch name={MODEL_MENU.fast} icon={<SpeedIcon className={ic} />} on={!!sel.fast} onClick={() => change({ ...sel, fast: !sel.fast })} /> : null}
           {menu?.perms.length ? (
             <>

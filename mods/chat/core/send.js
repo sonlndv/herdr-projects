@@ -7,6 +7,26 @@
 // Shared core: the source is core/send.js; bin/sync-shared copies it into the mods in lib/COPIES.
 
 import { excerpt } from "./chat-log.js";
+import { isNative, nativeRequest } from "./native-runtime.js";
+
+// Native admission is one request, never terminal typing or a retry after an uncertain outcome.
+export async function sendNative(io, addr, kind, text, options = {}) {
+  const state = typeof io.native === "function" ? io.native(addr) : io.native;
+  const target = typeof io.target === "function" ? io.target(addr) : io.target;
+  if (!target || (!target.pid && !target.sessionId && !target.sessionFile)) return { code: 1, stdout: "", stderr: "The native session has not been identified. Open Terminal." };
+  if (state?.capabilities?.send !== true) return { code: 1, stdout: "", stderr: "This native session has no message API. Open Terminal to continue." };
+  if (state.pendingRequests?.length) return { code: 1, stdout: "", stderr: "A native decision is waiting. Use its explicit controls or Open Terminal; sending text will not answer it." };
+  if (options.images?.length && state.capabilities.images !== true) return { code: 1, stdout: "", stderr: "This native session has no image-admission API. Open Terminal to attach images." };
+  if (options.again) return { code: 1, stdout: "", stderr: "The previous native send was not confirmed. Check the native conversation before sending again.", uncertain: true };
+  try {
+    const outcome = await nativeRequest(io, kind, "send", { ...target, text, delivery: state.working ? "steer" : "prompt", ...options }, io.machine ?? (addr.includes("/") ? addr.split("/")[0] : null));
+    if (outcome.admitted === false || outcome.accepted === false) return { code: 1, stdout: JSON.stringify(outcome), stderr: outcome.message ?? "The native runtime did not admit the message." };
+    if (outcome.admitted !== true && outcome.accepted !== true) return { code: 1, stdout: JSON.stringify(outcome), stderr: "Native message admission was not confirmed. Check the native conversation before sending again.", uncertain: true };
+    return { code: 0, stdout: JSON.stringify(outcome), native: outcome };
+  } catch (error) {
+    return { code: 1, stdout: "", stderr: String(error?.message ?? error), uncertain: true };
+  }
+}
 
 // hc's refusal, in words: { kind ("blocked": its own dialog is open), message }.
 export function refusal(r) {
@@ -142,6 +162,7 @@ export async function settleBox(io, addr, body, opts = SETTLE) {
 // box is watched until it is clear (settleBox). again: its last send stayed in the box; if the box
 // holds exactly it still, it gets Enter, never typed twice. -> hc's result; stuck: still in the box.
 export async function sendTyped(io, addr, kind, body, opts = SETTLE, again = false) {
+  if (isNative(kind)) return sendNative(io, addr, kind, body, { again });
   if (kind !== "claude") return io.hc(["send", addr, body]);
   if (again) {
     const box = await boxOf(io, addr);

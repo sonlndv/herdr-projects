@@ -8,6 +8,8 @@ import type { Snapshot, Place, Task, Need, Section, Machine, Chat, Message, Stat
 import * as T from "../core/tasks.js";
 import * as SPc from "../core/spaces.js";
 import { kindOf as kindOfTerm } from "../core/chat-reader.js";
+import { isNative, runtimeName } from "../core/native-runtime.js";
+import { nativeState, nativeQuestion } from "./native.ts";
 import * as CL from "../core/chat-log.js";
 import * as CV from "../core/chat-view.js";
 import { taskArtifacts } from "../core/task-artifacts.js";
@@ -20,7 +22,7 @@ import { codexChoice } from "../core/asks.js";
 const { SCREEN } = SCc as any;
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-const CLI_NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex" };
+const CLI_NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex", omp: "OMP", omo: "OMO", omh: "Hermes / OMH", hermes: "Hermes" };
 import * as MNc from "../core/menus.js";
 import * as APc from "../core/autopilot.js";
 const { machineLabel } = MNc as any;
@@ -236,7 +238,7 @@ export class Compat {
   machineStats: ((m: string | null) => any) | null = null;
 
   /** The model menu and restarts (service/agents.ts), set by main. */
-  agents: { info(addr: string, reader: any): Promise<unknown>; restart(addr: string, reader: any, pick: any): Promise<string>; choices(machine: string | null): Promise<unknown>; ownDefaults(): Promise<{ claude: unknown; codex: unknown }> } | null = null;
+  agents: { info(addr: string, reader: unknown): Promise<unknown>; restart(addr: string, reader: unknown, pick: unknown): Promise<string>; choices(machine: string | null): Promise<unknown>; ownDefaults(): Promise<Record<string, unknown>> } | null = null;
 
   /** Agents' secret asks (service/secrets.ts), set by main. */
   secrets: { asks(): { address: string; name: string; why: string }[] } | null = null;
@@ -335,6 +337,7 @@ export class Compat {
           const prog = cli ? CLI_NAMES[cli] ?? cli : agent?.name ?? null;
           return { id: t.id, name: (MNc as any).tabName(named(t.raw) ? t.raw : "", prog), named: named(t.raw), term: `t:${t.addr}`,
             ...(cli ? { cli } : {}), ...(agent || cli ? { agent: agent?.key ?? cli } : {}), state: stateOf(k), where: shortHome(k?.foreground?.cwd ?? k?.cwd),
+            ...(cli && isNative(cli) ? { chatSupported: true } : {}),
             // what its pane header calls it: the agent, else the program in front, else its title
             prog: prog ?? (k?.foreground?.name || k?.title || "Shell") };
         });
@@ -507,6 +510,7 @@ export class Compat {
   /** A followed conversation (core/chat-reader.js) as 2.1's Chat. A run of tool calls (3.0's tools row) is 2.1's turn
    *  rows: the first three, then "N more" (activity()). */
   chat(key: string, reader: any, t: any): Chat {
+    const native = isNative(reader.kind) ? nativeState(reader.nativeState ?? reader.native) : null;
     const messages: Message[] = [];
     let at = 0;
     const items: any[] = reader.conv?.items ?? [];
@@ -642,6 +646,10 @@ export class Compat {
     // what the agent asks now, as cards at the end of its chat
     for (const a of addr ? this.asks?.of(addr) ?? [] : []) messages.push({ id: `ask:${a.id}`, who: "agent", at: a.at, question: this.question(a, key) });
     if (codexCard) messages.push({ id: `ask:cq:${codexCard.id}`, who: "agent", at: codexCard.at ?? Date.now(), question: codexQuestion(codexCard, key) });
+    if (native) for (const request of native.pendingRequests) {
+      messages.push({ id: `ask:${native.sessionId}:${request.id}`, who: "agent", at: request.at ?? Date.now(),
+        question: nativeQuestion(request, key, native) });
+    }
     for (const a of (this.secrets?.asks() ?? []).filter((x) => x.address === addr)) messages.push({ id: `secret:${a.address}:${a.name}`, who: "agent", at: Date.now(), secret: this.secretAsk(a) } as Message);
     // asks that closed, as the window's quiet lines ("✓ Run: npm test · Allowed in the chat"); a question's own line is
     // its "Asked you" box, from the log
@@ -666,7 +674,7 @@ export class Compat {
       for (const e of (this.asks as any)?.endsOf?.(r.worker) ?? []) messages.push(quiet(`ae:${e.id}`, e.at, `${r.ref} · ${e.title} · ${e.how}`));
       screens(r.worker, r.ref, by);
     }
-    const st = t?.status?.state ?? null;
+    const st = native ? CV.nativeStatus(native) : t?.status?.state ?? null;
     // the CLI's own subagents still at work, then its background shells and watchers, above the box (3.0: the helpers
     // list; core/bg-jobs.js)
     // first its own helper agents in herdr (SHEP-54: a reviewer it started as its hc child), each opening to its own chat
@@ -674,8 +682,8 @@ export class Compat {
     const jobs: Job[] = [
       // (one that ended keeps its row a while, done, but no longer opens: its log is found by its running process)
       ...kids.map((s: any) => ({ id: `c:${s.address}`, kind: "child" as const, title: s.title, at: s.at, ...(s.ended ? {} : { chat: `t:${s.address}` }), status: s.status, role: s.role, ...(s.cli ? { cli: s.cli } : {}), ...(s.ended ? { ended: s.ended } : {}) })),
-      ...(reader.conv?.running?.() ?? []).map((h: any, i: number) => ({ id: `h${i}`, kind: "agent" as const, title: h.desc, at: h.at ?? Date.now() })),
-      ...(reader.jobs?.() ?? []).map((j: any) => ({ id: `b:${j.id}`, kind: j.kind === "monitor" ? "monitor" as const : "shell" as const, title: j.label, at: j.at ?? Date.now(), command: j.cmd, stop: true, ...(j.path ? { more: "output" as const } : {}) })),
+      ...(native ? [] : reader.conv?.running?.() ?? []).map((h: { desc: string; at?: number }, i: number) => ({ id: `h${i}`, kind: "agent" as const, title: h.desc, at: h.at ?? Date.now() })),
+      ...(native ? [] : reader.jobs?.() ?? []).map((j: { id: string; kind: string; label: string; at?: number; cmd?: string; path?: string }) => ({ id: `b:${j.id}`, kind: j.kind === "monitor" ? "monitor" as const : "shell" as const, title: j.label, at: j.at ?? Date.now(), command: j.cmd, stop: true, ...(j.path ? { more: "output" as const } : {}) })),
     ];
     // what it runs on, for the line under the box (core/agents.js: the window's model button says the same)
     let agent: any;
@@ -700,14 +708,17 @@ export class Compat {
     const under = st === "working" ? { doing: CV.doingWords(reader.conv, report) ?? "", ...(reader.conv?.waiting ? { waits: true } : {}) }
       : st === "blocked" && !cards ? { blocked: report.replace(/^answer:\s*/i, "") } : {};
     // a note under the conversation (a lost session being started again: service/watch.ts)
-    const note = addr ? watch?.notes?.get(addr)?.text : undefined;
+    const note = reader.error || (addr ? watch?.notes?.get(addr)?.text : undefined);
     // instead of the conversation, the window's notice: still opening, not a chat agent, its log not found, ended
     const kind = kindOfTerm(t);
     const notice = !reader.conv && (reader.state === "finding" || reader.state === "pending") ? "opening"
       : reader.state === "missing" && reader.pinned ? "gone"
-      : reader.state === "none" || reader.state === "missing" ? ((t && t.state !== "live") || !t ? "ended" : kind ? "none" : "unsupported")
+      : reader.state === "none" || reader.state === "missing" ? ((t && t.state !== "live") || !t ? "ended" : kind && !isNative(kind) ? "none" : "unsupported")
       : !reader.pinned && (!t || t.state !== "live") && !items.length ? "ended" : null;
     const failed = failedOf(addr);
-    return { key, messages, ...(failed.length ? { failed } : {}), ...head, ...under, ...(note ? { note } : {}), ...(notice ? { notice } : {}), ...(agent ? { agent } : {}), ...(jobs.length ? { jobs } : {}), working: st === "working", cli: reader.kind === "codex" ? "codex" : "claude", ...(reader.pinned || (t && t.state !== "live") ? { finished: true } : {}) };
+    return { key, messages, ...(failed.length ? { failed } : {}), ...head, ...under, ...(note ? { note } : {}), ...(notice ? { notice } : {}), ...(agent ? { agent } : {}), ...(jobs.length ? { jobs } : {}),
+      ...(isNative(reader.kind) ? { runtime: { kind: reader.kind, name: runtimeName(reader.kind), ...(native ? { sessionId: native.sessionId, capabilities: native.capabilities, settled: native.settled, pendingAsyncWork: native.pendingAsyncWork } : { capabilities: { history: false, send: false, interrupt: false, configure: false, answer: false, fork: false } }) } } : {}),
+      ...(native && (native.subagents.length || native.jobs.length) ? { nativeWork: [...new Map([...native.jobs, ...native.subagents].map((work) => [work.id, work])).values()] } : {}),
+      working: st === "working", cli: reader.kind ?? kindOfTerm(t) ?? "unknown", ...(reader.pinned || (t && t.state !== "live") ? { finished: true } : {}) };
   }
 }

@@ -2,7 +2,15 @@
 // rules both the window's model menu (lib/agent.js, mods/chat-models) and the web app's use. Reading an agent's own
 // settings and restarting it run where each side runs commands (lib/agent.js, service/agents.ts).
 // Shared core: the source is core/agents.js; bin/sync-shared copies it into the mods in lib/COPIES.
-export const NAMES = { claude: "Claude Code", codex: "Codex" };
+import { isNative } from "./native-runtime.js";
+
+/** @type {Record<string, string>} */
+export const NAMES = { claude: "Claude Code", codex: "Codex", omp: "OMP", omo: "OMO", omh: "OMH", hermes: "Hermes" };
+export const KINDS = Object.keys(NAMES);
+
+function requireKind(kind) {
+  if (!NAMES[kind]) throw new Error(`Unsupported agent runtime: ${kind}`);
+}
 
 // Claude Code's current models, as its /model menu offers them. `id` is what --model gets;
 // `match` the names a running agent may report for it.
@@ -59,13 +67,16 @@ export const DEFAULTS = `
 if [ "$1" = claude ]; then
   f="$HOME/.claude/settings.json"
   command -v jq >/dev/null && [ -f "$f" ] && jq -r '"model\\t\\(.model // "")", "effort\\t\\(.effortLevel // "")", "fast\\t\\(if .fastMode == true then "on" else "" end)", "per\\t\\(.modelSettings // {} | with_entries(.value |= (.effortLevel // null)) | tojson)", "mode\\t\\(.permissions.defaultMode // "")"' "$f" 2>/dev/null
-else
+elif [ "$1" = codex ]; then
   f="$HOME/.codex/config.toml"
   for k in model model_reasoning_effort service_tier sandbox_mode approval_policy; do
     printf '%s\\t%s\\n' "$k" "$(sed -n "s/^$k[[:space:]]*=[[:space:]]*\\"\\{0,1\\}\\([^\\"]*\\)\\"\\{0,1\\}.*/\\1/p" "$f" 2>/dev/null | head -1)"
   done
   c="$HOME/.codex/models_cache.json"
   [ -f "$c" ] && { printf 'models\\t'; tr -d '\\n' < "$c"; echo; }
+else
+  printf 'Unsupported agent defaults: %s\\n' "$1" >&2
+  exit 1
 fi
 true`;
 
@@ -75,6 +86,11 @@ function parsePer(text) {
 
 // The agent's own settings, from DEFAULTS' output on its machine.
 export function parseDefaults(kind, stdout) {
+  requireKind(kind);
+  if (isNative(kind)) {
+    const data = JSON.parse(stdout || "{}");
+    return { ...data, model: data.model ?? null, effort: data.effort ?? null, fast: false, models: data.models ?? [] };
+  }
   const out = {};
   for (const line of (stdout ?? "").split("\n")) {
     const t = line.indexOf("\t");
@@ -102,6 +118,16 @@ export function current(kind, argv, meta, dflt) {
   argv = argv ?? [];
   meta = meta ?? {};
   dflt = dflt ?? {};
+  requireKind(kind);
+  if (isNative(kind) && dflt.native) meta = { ...meta, ...dflt.native };
+  if (isNative(kind)) {
+    const model = typeof meta.model === "object" ? meta.model?.id : meta.model;
+    const id = dflt.model ?? model ?? flag(argv, "--model", "-m") ?? null;
+    return { agent: kind, model: id, label: dflt.models?.find((m) => m.id === id)?.label ?? null,
+      effort: meta.thinking ?? meta.effort ?? flag(argv, "--thinking") ?? dflt.effort ?? null,
+      profile: flag(argv, "--profile"), perm: meta.mode ?? dflt.mode ?? null, fast: false,
+      used: meta.used ?? null, window: meta.window ?? meta.model?.contextWindow ?? null };
+  }
   if (kind === "claude") {
     const alias = flag(argv, "--model") ?? dflt.model;
     let fast = dflt.fast;
@@ -148,7 +174,19 @@ export function contextWords(c) {
 // { name, models: [{ id, name, efforts, defaultEffort, fast }], perms }: every model the CLI
 // offers (Codex: its own models_cache.json; Claude Code: its /model menu), the picker searches them.
 // `dflt` is that agent's settings (defaults()); `current` its running model, kept in the list.
+/** @returns {{name:string, models:Array<{id:string,name:string,efforts:string[],defaultEffort:string|null,fast:boolean,nativeDefault?:boolean}>, perms:Array<{id:string,label:string}>, capabilities?:{configure:boolean,customModel:boolean}, error?:string|null}} */
 export function menuFor(agent, dflt, current = null) {
+  requireKind(agent);
+  if (isNative(agent)) {
+    const models = (dflt?.models ?? []).map((m) => ({ id: m.id, name: m.label ?? m.id,
+      efforts: m.efforts ?? [], defaultEffort: m.defaultEffort ?? null, fast: false }));
+    if (!models.length && !current)
+      models.push({ id: "", name: `${NAMES[agent]} defaults`, nativeDefault: true, efforts: [], defaultEffort: null, fast: false });
+    if (current && !models.some((m) => m.id === current))
+      models.unshift({ id: current, name: current, efforts: [], defaultEffort: null, fast: false });
+    return { name: NAMES[agent], models, perms: dflt?.perms ?? [], error: dflt?.error ?? null,
+      capabilities: { configure: false, customModel: false, ...dflt?.capabilities, ...dflt?.native?.capabilities } };
+  }
   if (agent === "claude") {
     const models = CLAUDE_MODELS.map((m) => ({ id: m.id, name: m.name, efforts: CLAUDE_EFFORTS,
       defaultEffort: dflt?.per?.[m.match[1].replace(/\[1m\]$/, "")] ?? dflt?.effort ?? null, fast: m.id.startsWith("opus") }));
@@ -164,7 +202,8 @@ export function menuFor(agent, dflt, current = null) {
 
 // The levels a model typed by id gets: its agent's usual ones.
 export function typedModel(agent, id) {
-  return { id, name: agent === "claude" ? modelName(id) : id, efforts: agent === "claude" ? CLAUDE_EFFORTS : ["low", "medium", "high", "xhigh"], defaultEffort: null, fast: false, typed: true };
+  requireKind(agent);
+  return { id, name: agent === "claude" ? modelName(id) : id, efforts: agent === "claude" ? CLAUDE_EFFORTS : agent === "codex" ? ["low", "medium", "high", "xhigh"] : [], defaultEffort: null, fast: false, typed: true };
 }
 
 // The person's picks in the model menus (the window's and the web's alike), in PICKS_FILE under the
@@ -213,6 +252,7 @@ export function modelSections(menus, agent, picks, q) {
   // a pinned or recent model typed by id (no CLI lists it) stays on offer
   const saved = (k) => {
     const models = menus?.[k]?.models ?? [], known = new Set(models.map((m) => m.id));
+    if (isNative(k) && !menus[k]?.capabilities?.customModel) return models;
     const ids = [...new Set([...picks.pinned, ...picks.recent].filter((x) => x.startsWith(`${k}:`)).map((x) => x.slice(k.length + 1)))];
     return [...models, ...ids.filter((id) => !known.has(id)).map((id) => ({ ...typedModel(k, id), typed: false }))];
   };
@@ -239,7 +279,7 @@ export function modelSections(menus, agent, picks, q) {
   // one word that could be an id, and no model has it: start any agent on it as typed
   if (/^[\w.\[\]-]{2,60}$/.test(query)) {
     const rows = [agent, ...Object.keys(menus ?? {}).filter((x) => x !== agent)]
-      .filter((k) => menus?.[k] && !saved(k).some((m) => m.id === query)).map((k) => ({ agent: k, ...typedModel(k, query), pinned: false }));
+      .filter((k) => menus?.[k] && (!isNative(k) || menus[k].capabilities?.customModel) && !saved(k).some((m) => m.id === query)).map((k) => ({ agent: k, ...typedModel(k, query), pinned: false }));
     if (rows.length) out.push({ key: "typed", title: "Use the id typed", agent, rows, more: 0 });
   }
   return out;
@@ -296,6 +336,18 @@ function kept(kind, argv) {
 // first message), or null when argv resumed none: for a fresh start once that session is gone.
 export function freshArgv(kind, argv) {
   argv = argv ?? [];
+  requireKind(kind);
+  if (isNative(kind)) {
+    const at = argv.findIndex((a) => String(a).split("/").pop() === "shepherdr-native-run");
+    if (at < 0) return null;
+    const payload = JSON.parse(argv[at + 2] || "{}");
+    if (payload.nativeArgs || payload.revivable === false) return null;
+    if (!payload.sessionId && !payload.sessionFile) return null;
+    delete payload.sessionId;
+    delete payload.sessionFile;
+    delete payload.message;
+    return [argv[at], kind, JSON.stringify(payload)];
+  }
   const at = argv.findIndex((a, i) => (i === 0 || !a.startsWith("-")) && /^(claude|codex)$/.test(String(a).split("/").pop()));
   if (at < 0) return null;
   const rest = argv.slice(at + 1), out = [argv[at]];
@@ -322,6 +374,18 @@ export function freshArgv(kind, argv) {
 // How to start the chosen agent: { argv, resume } (resume: argv already continues the session).
 // `session`: the old conversation's id when it can be resumed (same agent only).
 export function argvFor(pick, old) {
+  requireKind(pick.agent);
+  if (isNative(pick.agent)) {
+    const payload = { model: pick.model || undefined, effort: pick.effort || undefined, profile: pick.profile || undefined, hermesHome: pick.hermesHome || undefined };
+    if (pick.fast || pick.perm) throw new Error("Native runtimes preserve their own speed and permission policy.");
+    const base = ["shepherdr-native-run", pick.agent, JSON.stringify(payload)];
+    const session = pick.agent === old.agent ? old.sessionFile ?? old.session : null;
+    if (session) {
+      const target = ["omp", "omo"].includes(pick.agent) ? { sessionFile: session } : { sessionId: session };
+      return { argv: [base[0], base[1], JSON.stringify({ ...payload, ...target })], base, resume: true };
+    }
+    return { argv: base, base, resume: false };
+  }
   const same = pick.agent === old.agent;
   const flags = same ? kept(pick.agent, old.argv ?? []) : [];
   if (pick.agent === "claude") {
@@ -349,12 +413,16 @@ export function argvFor(pick, old) {
 
 // The conversation's id, from its log's file name.
 export function sessionOf(kind, path) {
+  requireKind(kind);
+  if (isNative(kind)) return null;
   const m = kind === "claude" ? /([0-9a-f-]{36})\.jsonl$/.exec(path ?? "") : /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/.exec(path ?? "");
   return m ? m[1] : null;
 }
 
 // A copy of the conversation in a new tab beside this one, through the CLI's own fork.
 export function forkArgv(kind, argv, session) {
+  requireKind(kind);
+  if (isNative(kind)) throw new Error("Native conversations must fork through their native runtime.");
   argv = argv ?? [];
   // The same model, effort and speed as the original.
   const same = kind === "claude"
